@@ -168,7 +168,7 @@
 - [x] Remove opposite modes except **Keep Opposite (Scaled Qty + Adjusted Entry)**.
 - [x] Delete N+1 reissue delay path; always immediate.
 - [X] Centralize **all** entries via `f_placeBracket(...)`.
-- [ ] Centralize **all** exits via `emitExit(reason, price)`; remove parallel exit paths.
+- [X] Centralize **all** exits via `emitExit(reason, price)`; remove parallel exit paths.
 - [ ] Implement **breakout snapshots** for session validity and sizing; no rechecks later.
 - [X] Remove VWAP Distance / EMA Slope / RSI filters and their inputs.
 - [X] Keep VWAP/VWMA plots; remove unused plot config inputs.
