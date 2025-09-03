@@ -167,11 +167,11 @@
 - [X] Remove ATR & VWAP stop types; `slType ∈ {RR, Points}` only.
 - [x] Remove opposite modes except **Keep Opposite (Scaled Qty + Adjusted Entry)**.
 - [x] Delete N+1 reissue delay path; always immediate.
-- [ ] Centralize **all** entries via `f_placeBracket(...)`.
+- [X] Centralize **all** entries via `f_placeBracket(...)`.
 - [ ] Centralize **all** exits via `emitExit(reason, price)`; remove parallel exit paths.
 - [ ] Implement **breakout snapshots** for session validity and sizing; no rechecks later.
-- [ ] Remove VWAP Distance / EMA Slope / RSI filters and their inputs.
-- [ ] Keep VWAP/VWMA plots; remove unused plot config inputs.
+- [X] Remove VWAP Distance / EMA Slope / RSI filters and their inputs.
+- [X] Keep VWAP/VWMA plots; remove unused plot config inputs.
 - [ ] Preserve Early‑Exit strictness & proxy exit JSON paths.
 
 ## 12) Stuff to come back to
