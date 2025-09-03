@@ -174,3 +174,5 @@
 - [ ] Keep VWAP/VWMA plots; remove unused plot config inputs.
 - [ ] Preserve Early‑Exit strictness & proxy exit JSON paths.
 
+## 12) Stuff to come back to
+1) oppTPOverrideActive, given the hardcoding of options we no longer should need this override. 
