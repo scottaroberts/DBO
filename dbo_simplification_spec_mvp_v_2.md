@@ -164,9 +164,9 @@
 ---
 
 ## 11) Migration Checklist
-- [ ] Remove ATR & VWAP stop types; `slType ∈ {RR, Points}` only.
-- [ ] Remove opposite modes except **Keep Opposite (Scaled Qty + Adjusted Entry)**.
-- [ ] Delete N+1 reissue delay path; always immediate.
+- [X] Remove ATR & VWAP stop types; `slType ∈ {RR, Points}` only.
+- [x] Remove opposite modes except **Keep Opposite (Scaled Qty + Adjusted Entry)**.
+- [x] Delete N+1 reissue delay path; always immediate.
 - [ ] Centralize **all** entries via `f_placeBracket(...)`.
 - [ ] Centralize **all** exits via `emitExit(reason, price)`; remove parallel exit paths.
 - [ ] Implement **breakout snapshots** for session validity and sizing; no rechecks later.
