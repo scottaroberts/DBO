@@ -104,13 +104,13 @@ stateDiagram-v2
 ## 2) OppAdd Issuance Logic (Single-Shot) — Decision Flow
 
 ```mermaid
-flowchart LR
-    A[Initial entry fills: Long/Short] --> B{OppAdd already issued this cycle?}
-    B -->|Yes| C[Do nothing (no further OppAdd)]
-    B -->|No| D{Context gates allow OppAdd?<br/>(gates_for_oppadd)}
-    D -->|No| C
-    D -->|Yes| E[Issue OppAdd (Long if entry Short,<br/>Short if entry Long)]
-    E --> F[Mark oppAddIssuedThisCycle = true;<br/>store OppAdd ID suffix (bar_index) and dir]
+graph LR
+A[Initial entry fills Long or Short] --> B{OppAdd already issued this cycle}
+B -->|Yes| C[No action]
+B -->|No| D{Gates allow OppAdd}
+D -->|No| C
+D -->|Yes| E[Issue OppAdd]
+E --> F[Mark oppAddIssuedThisCycle true and store id suffix]
 ```
 
 **Gate context**
@@ -122,18 +122,19 @@ flowchart LR
 ## 3) PROFIT vs STOP Cleanup — Decision Tree
 
 ```mermaid
-flowchart TB
-    S[Initial entry closes] --> T{Exit type}
-    T -- PROFIT --> P1[Cancel primaries]
-    P1 --> P2[Cancel OppAdd (if exists)]
-    P2 --> P3[Cancel original opposite bracket]
-    P3 --> P4[Reset OppAdd tracking]
-    P4 --> P5[Rearm brackets via gates_for_reissue]
+graph TB
+S[Initial entry closes] --> T{Exit type}
+T -->|PROFIT| P1[Cancel primaries]
+P1 --> P2[Cancel OppAdd]
+P2 --> P3[Cancel original opposite bracket]
+P3 --> P4[Reset OppAdd tracking]
+P4 --> P5[Rearm via reissue gates]
 
-    T -- STOP --> Q1[Cancel only the stopped side]
-    Q1 --> Q2[Keep original opposite bracket + OppAdd in place]
-    Q2 --> Q3[Await potential fills (0..2)]
-    Q3 --> Q4[When all resident opposite orders complete, rearm]
+
+T -->|STOP| Q1[Cancel only stopped side]
+Q1 --> Q2[Keep original opposite bracket and OppAdd]
+Q2 --> Q3[Wait for possible fills 0..2]
+Q3 --> Q4[When all opposite orders complete rearm]
 ```
 
 ---
@@ -141,23 +142,24 @@ flowchart TB
 ## 4) Modular Gate Manager — Per-context Application
 
 ```mermaid
-flowchart LR
-    subgraph Inputs & State
-        A1[sessionValid / sessionValidFrozen / tradingHalted]
-        A2[Computed filters: VWAP distance, EMA slope, RSI, range width]
-        A3[MidReturn latch: active only after PROFIT]
-        A4[Context switches: Entry / Reissue / OppAdd]
-        A5[Scope toggles: oppAdds_useSev3/VWAP/Range/EMA/RSI/MidReturn]
-    end
+graph LR
+subgraph Inputs_and_State
+A1[session valid flags]
+A2[filters vwap ema rsi range]
+A3[midreturn latch active after profit]
+A4[context switches entry reissue oppadd]
+A5[scope toggles per gate]
+end
 
-    A1 --> B{Base preconditions
-(session & halt checks)}
-    B -- Fail --> Z[BLOCK]
-    B -- Pass --> C[gates_for_entry / gates_for_reissue / gates_for_oppadd]
 
-    C --> D{All enabled gates pass?}
-    D -- No --> Z
-    D -- Yes --> E[ALLOW]
+A1 --> B{Base preconditions}
+B -->|Fail| Z[BLOCK]
+B -->|Pass| C[gates for entry or reissue or oppadd]
+
+
+C --> D{All enabled gates pass}
+D -->|No| Z
+D -->|Yes| E[ALLOW]
 ```
 
 **Context rules**
