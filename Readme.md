@@ -105,14 +105,12 @@ stateDiagram-v2
 
 ```mermaid
 flowchart LR
-    A[Initial entry fills (Long or Short)] --> B{OppAdd already issued this cycle?}
-    B -- Yes --> C[Do nothing (no further OppAdd)]
-    B -- No --> D{Context gates allow OppAdd?
-(gates_for_oppadd)}
-    D -- No --> C
-    D -- Yes --> E[Issue OppAdd (Long if entry Short, Short if entry Long)]
-    E --> F[Mark oppAddIssuedThisCycle = true
-Store OppAdd ID suffix (bar_index) and dir]
+    A[Initial entry fills: Long/Short] --> B{OppAdd already issued this cycle?}
+    B -->|Yes| C[Do nothing (no further OppAdd)]
+    B -->|No| D{Context gates allow OppAdd?<br/>(gates_for_oppadd)}
+    D -->|No| C
+    D -->|Yes| E[Issue OppAdd (Long if entry Short,<br/>Short if entry Long)]
+    E --> F[Mark oppAddIssuedThisCycle = true;<br/>store OppAdd ID suffix (bar_index) and dir]
 ```
 
 **Gate context**
