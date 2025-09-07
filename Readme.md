@@ -185,5 +185,143 @@ D -->|Yes| E[ALLOW]
 
 ## 7) License
 
+---
+
+## Centralized Exit Transaction (Atomic Exit)
+
+**Goal:** one bar-atomic path that performs targeted cancels → flatten → alerts/JSON → label, so exits can’t desync from UI or OppAdd rules.
+
+---
+
+### Invariants
+- No `cancel_all()`; only targeted cancels by ID.
+- Labels trail actions (never lead).
+- One OppAdd per cycle. Profit of the **initial** entry clears the opposite inventory; Stop keeps it resident.
+- The function is **pure plumbing**: it does not mutate predeclared globals; callers update state based on returned signals.
+
+---
+
+### Function Contract
+f_exit_atomic(
+reason, // "TP" | "SL" | "Early" | "EOS" | "Manual"
+role, // "initial" | "opposite_primary" | "opposite_oppadd"
+side, // "long" | "short"
+price, ts, tz, // exit metadata
+chartTkr, proxyTkr, // routing
+ids, // struct of known order IDs (this+opposite, incl. OppAdd)
+policy // what to cancel; label toggle
+) -> (
+didExit, didSendProxy,
+requestOppAddReset, // caller should clear OppAdd tracking
+requestRearm, // caller should rearm brackets
+canceledOppPrimary, canceledOppAdd
+)
+
+**`ids` (suggested fields):**
+- This side: `idEntry`, `idExit`.
+- Opposite primary: `idOppPrimary`, `idOppPrimaryExit`.
+- Opposite OppAdd: `idOppAddEntry`, `idOppAddExit`.
+
+**`policy` (booleans the caller sets):**
+- `cancelThisSideChildren` (yes when closing a live position).
+- `cancelOppPrimary`, `cancelOppAdd` (per matrix below).
+- `cancelEverything` (EOS full cleanup).
+- `emitLabel` (UI trace switch).
+
+---
+
+### Ordering Guarantees (inside `f_exit_atomic`)
+1. **Targeted cancels first**  
+   Cancel only the IDs that policy requires and that are non-empty.
+2. **Flatten position**  
+   `strategy.close_all(comment=...)` with canonical comment strings (e.g., **"Early Positive Close Exit"**).
+3. **Chart alert emit**  
+   Route via existing `emitExit(...) → f_send_exit(...)`.
+4. **Proxy JSON emit**  
+   Only if `proxyTkr != chartTkr`; return `didSendProxy`.
+5. **Label last**  
+   Only if `didExit` and `policy.emitLabel`.
+
+---
+
+### Policy Matrix (spec → flags)
+
+| Event (who/why)                         | cancelThisSideChildren | cancelOppPrimary | cancelOppAdd | requestOppAddReset | requestRearm |
+|-----------------------------------------|:----------------------:|:----------------:|:------------:|:------------------:|:------------:|
+| **Initial** position **TP**             | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **Initial** position **Early** (profit) | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **Initial** position **SL**             | ✅ | ❌ | ❌ | ❌ | ❌ *(defer)* |
+| **Opposite primary** completes (TP/SL)  | ✅ | ❌ | ❌ | ❌ | if no opposite orders remain → ✅ |
+| **Opposite OppAdd** completes (TP/SL)   | ✅ | ❌ | ❌ | ❌ | if no opposite orders remain → ✅ |
+| **EOS / Flatten-All**                   | ✅ | ✅ | ✅ | ✅ | ✅ *(per session rules)* |
+
+**Meaning:**
+- **Initial PROFIT/Early:** clear opposite inventory (primary + OppAdd), reset OppAdd tracking, and rearm.
+- **Initial STOP:** keep opposite inventory posted; rearm only after all remaining opposite orders complete.
+
+---
+
+### Caller Responsibilities (no global writes inside function)
+After calling `f_exit_atomic(...)`, the caller must:
+- Reset OppAdd tracking if `requestOppAddReset`.
+- Rearm brackets if `requestRearm`.
+- Maintain a small “opposite outstanding” counter (0..2). Each opposite completion decrements it; when it hits 0, set `requestRearm`.
+
+---
+
+### Canonical Comment Strings
+Use stable strings for fills/telemetry:
+- **"Early Positive Close Exit"** (early profit flatten)
+- **"Take Profit Close Exit"**
+- **"Stop Loss Close Exit"**
+- **"End Of Session Close Exit"**
+- **"Manual Close Exit"**
+
+---
+
+### Call-Site Recipes
+
+**1) Early Positive Close Exit (initial long example)**  
+- Inputs: `reason="Early"`, `role="initial"`, `side="long"`.  
+- Policy: `cancelThisSideChildren=1`, `cancelOppPrimary=1`, `cancelOppAdd=1`, `requestOppAddReset=1`, `requestRearm=1`, `emitLabel=1`.
+
+**2) Initial STOP (long)**  
+- Inputs: `reason="SL"`, `role="initial"`, `side="long"`.  
+- Policy: `cancelThisSideChildren=1`; all others `0`. Opposite primary + OppAdd remain active.
+
+**3) Opposite completion (post-STOP)**  
+- Inputs: `reason="TP"` or `"SL"`, `role="opposite_primary"` **or** `"opposite_oppadd"`, `side` set to that opposite.  
+- Policy: `cancelThisSideChildren=1`; others `0`. After the call, if **no opposite orders remain** → set `requestRearm=1`.
+
+**4) EOS / Flatten-All**  
+- Inputs: `reason="EOS"`.  
+- Policy: `cancelEverything=1`, `emitLabel` optional. Return values typically imply `requestOppAddReset=1`, `requestRearm=1` for next session.
+
+---
+
+### OppAdd Rules (nuances)
+- **Single-shot per cycle**: issued exactly once on the bar the initial entry fills. On **initial PROFIT/Early**, central exit cancels both the opposite primary and the OppAdd, and signals `requestOppAddReset`.
+- **After initial STOP**: both opposite orders stay posted and may fill; **do not** reissue OppAdd within the same cycle; rearm only after they finish.
+
+---
+
+### Edge Cases & Idempotency
+- **Same-bar retriggers:** guard labels on `didExit`; duplicate cancels are harmless (ID checks).
+- **Partial fills:** central exit always flattens the **position**; cancels target working children by ID.
+- **Manual exits:** map to `"Manual"`; recommended to treat as PROFIT for cleanup (configurable).
+- **Chart vs Proxy:** function emits both the chart alert and optional proxy JSON; caller clears proxy state using `didSendProxy`.
+
+---
+
+### Test Checklist
+- Early Positive: label appears **after** exit calls; opposite inventory removed; OppAdd tracking reset; rearm scheduled.
+- Initial STOP: opposite inventory persists; no rearm until both opposite legs complete.
+- Opposite completions: decrement outstanding count; rearm when zero.
+- EOS: all IDs canceled; position flattened; next session armed.
+- Comments in fills match the canonical strings above.
+
+
+
+
 MIT (or project default).
 
