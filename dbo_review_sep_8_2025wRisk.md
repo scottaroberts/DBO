@@ -346,3 +346,156 @@ f_send_opposite_on_proxy(
 4) **OppAdd gates function** — explicit scope with MidReturn disabled by default.  
 5) **Terminology alignment** — clarify UI and README to **Max Sets**.
 
+
+# DBO — Gap Remediation & Refactor Order (Implementation Plan)
+
+**Date:** 2025-09-08  
+**Owner:** DBO Team  
+**Scope:** Sequence and guardrails to fix high‑risk behavioral gaps first, then apply bloat‑reduction refactors to keep the codebase clean and future‑proof.  
+**Note:** This plan is *behavior‑first*: no functional changes until a tiny “safety scaffolding” lands to make the fixes surgical and low‑risk.
+
+---
+
+## TL;DR — Recommended Order
+
+1. **Phase 0 — Safety scaffolding (no behavior change)**
+2. **Phase 1 — Close high‑risk gaps** (Profit cancel semantics; single‑shot OppAdd latch; opposite‑outstanding lifecycle)
+3. **Phase 2 — Medium‑risk & cleanliness** (OppAdd gates function; direction‑agnostic opposite reissue; unified reset usage)
+4. **Phase 3 — Remaining bloat reduction & polish** (low‑risk cleanups; terminology alignment)
+
+---
+
+## Phase 0 — Safety Scaffolding (Zero Behavior Change)
+*Purpose: enable surgical fixes; reduce drift; keep diffs small.*
+
+- **Exit Context Builders**  
+  Introduce a tiny helper that **packages all IDs** deterministically for any cleanup call: this side entry/exit IDs, **opposite primary** IDs, **OppAdd** IDs (if present), and optional **proxy** IDs.  
+  *No policy, no cancels—just data bundling.*
+
+- **Unified Reset Block (structure only)**  
+  A single function to reset state (OppAdd overlay, counters, latches) when told to; *do not* change call‑site behavior yet. This centralizes resets for later Phases.
+
+- **Introduce state fields only**  
+  Add but **do not yet activate**:
+  - `oppAddIssuedThisCycle` (bool latch)
+  - `oppOutstanding` (0..2 counter for opposite residency)
+  - Lightweight logging/metrics counters
+
+> **Outcome:** No change in live behavior; we gain the plumbing to make the next steps one‑liners.
+
+--- 
+
+## Phase 1 — Close the High‑Risk Gaps
+
+### 1) PROFIT cancel semantics (**Priority 1**)
+**Goal:** After a TP, ensure **all opposing orders** (original opposite + any OppAdd, including proxy legs) are **canceled first**, then close/emit, then re‑arm.
+
+- **Use Exit Context Builder** at PROFIT call‑site(s).
+- Call the atomic exit with **`doCancelAllBefore = true`** and pass the **full opposite scope** (primary + OppAdd IDs; chart + proxy where applicable).
+- After atomic exit returns, perform **re‑arm** per gates.
+
+**Risk removed:** Stale opposite orders persisting beyond Profit and filling later.
+
+---
+
+### 2) Single‑shot OppAdd latch (**Priority 1**)
+**Goal:** Guarantee **exactly one OppAdd per cycle** (on Bar N), regardless of overlay/handle edge cases.
+
+- Gate OppAdd issuance on `not oppAddIssuedThisCycle`.
+- Set `oppAddIssuedThisCycle := true` upon the **first** OppAdd send in the cycle.
+- Clear latch only at **Profit/EOS** or when the **stop‑driven cycle** legitimately ends.
+
+**Risk removed:** Duplicate OppAdds stacking exposure within a single cycle.
+
+---
+
+### 3) Opposite‑outstanding lifecycle (**Priority 2**)
+**Goal:** After a **STOP**, do **not re‑arm** until all **opposite** legs have completed (or been canceled by policy).
+
+- Increment `oppOutstanding` when opposite orders are created.
+- **Decrement** on opposite **TP/SL** completions (chart and proxy).
+- Gate STOP‑path **re‑arm** on `oppOutstanding == 0` *and* gates pass.
+
+**Risk removed:** Premature re‑arm while opposite orders still live (double exposure).
+
+---
+
+## Phase 2 — Medium‑Risk & Cleanliness
+
+### 4) OppAdd gates function (**Priority 3**)
+**Goal:** Make it explicit that **OppAdd ignores MidReturn by default** (per spec), while Entry/Reissue may honor MidReturn.
+
+- Add `gates_for_oppadd()` → returns `_blocked`.
+- Feed `_blocked` into the OppAdd send wrapper.
+- Document the default (MidReturn **off** for OppAdd) and any switches if needed.
+
+### 5) Direction‑agnostic opposite reissue & Unified Reset (full use)
+- Use the existing opposite placement helper in a **side‑agnostic** way to reduce branch divergence.
+- Replace scattered resets with the **Unified Reset Block** created in Phase 0.
+
+**Benefit:** Fewer drift points, easier inspection, symmetric behavior.
+
+---
+
+## Phase 3 — Remaining Bloat Reduction & Polish
+
+- Small, behavior‑neutral dedupes and naming cleanups.
+- Clarify terminology to **“Max Sets”** (UI/panel/README) so limits match engine semantics.
+- Keep comments tight and colocated with the central sinks.
+
+---
+
+## Why This Order?
+
+- **Risk first.** Gaps 1 & 2 are the only ones that can leave *unintended* orders live post‑Profit or allow duplicate OppAdds in a cycle. Fix these immediately.
+- **Minimal scaffolding before fixes.** The Exit Context Builder and a reset hook **without** behavior change ensure the Profit fix is a one‑liner and that we never miss cancel targets.
+- **Containment.** Latches and counters are wired after the scaffolding so they live in exactly one place, minimizing future refactors.
+
+---
+
+## Rollout & Safety Nets
+
+- **Feature toggles** (default **ON** for quick rollback):
+  - `useProfitStrictCancel`
+  - `useOppAddSingleShot`
+  - `useOppositeDrainBeforeRearm`
+
+- **Observability (Data Window / logs):**
+  - `oppOutstanding`, `oppAddIssuedThisCycle`
+  - `profitCancelsCount` (how many opposing IDs targeted per Profit)
+  - `oppAddGateBlocks` (count of OppAdd gate blocks per session)
+
+- **Dry‑run checklist:**
+  - Backtest vs live divergence noted for proxy‑only behavior; ensure toggles and logs emit in realtime only as needed.
+  - Validate cancel sequencing under broker latency with the atomic exit’s **cancel → close → emit** ordering.
+
+---
+
+## Acceptance Criteria (Per Gap)
+
+- **Profit cancel semantics**: After any TP, *no* opposite orders (primary or OppAdd; chart or proxy) remain working. Re‑arm occurs only after atomic exit returns success.
+- **Single‑shot OppAdd**: Within a cycle, exactly one OppAdd can be emitted; repeated attempts are blocked and counted in `oppAddGateBlocks`.
+- **Opposite‑drain re‑arm**: After STOP, re‑arm does **not** occur until `oppOutstanding == 0`.
+- **OppAdd gates**: `gates_for_oppadd()` present; default excludes MidReturn; toggling behavior is explicit and logged.
+- **Telemetry**: Counters present and visible in the Data Window for quick diagnosis.
+
+---
+
+## Touch Points (No Code Here; For Planning Only)
+
+- **Profit handler → atomic exit** (call‑site parameters; cancel scope)
+- **OppAdd send wrapper** (latch gate; `_blocked` from `gates_for_oppadd()`)
+- **Opposite completion handlers** (TP/SL decrements; proxy mirrored)
+- **Re‑arm decision point** (STOP branch gate on `oppOutstanding == 0`)
+- **Unified Reset Block** (Profit/EOS/Stop‑drain; OppAdd overlay + counters)
+
+---
+
+## Change Management
+
+- **Phase 0 + Phase 1** can ship in one commit (small diff; high safety impact).  
+- **Phase 2–3** batched later with test notes and updated README/Panel copy.
+
+> This document is intended to be copied into the repo’s `docs/` or spec section to track the remediation order and acceptance criteria without embedding code changes.
+
+
