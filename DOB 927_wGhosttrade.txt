@@ -2051,7 +2051,8 @@ bool timeOnceOK172   = na(lastOppAddTime172) or lastOppAddTime172 != time  // �
 
 
 // ── MAIN ───────────────────────────────────────────────────────
-if dirOpp172 != 0 and ctxOKOppAdd172
+if dirOpp172 != 0 and ctxOKOppAdd172 and oncePerBarOK172 and idOnceOK172 and timeOnceOK172 and not oppIssuedThisBar172  // 🟥 PATCH: move de-dupe to top-level to block same-bar/time/id re-entry on history
+
     // 🟦 PATCH: silent de-dupe gate (history-only ghost trade fix). If this blocks, we do nothing and emit no labels.
     if oncePerBarOK172 and idOnceOK172 and timeOnceOK172 and not oppIssuedThisBar172  // 🟦 PATCH
         // 🟦 PATCH: history-only early precommit — claim (bar,id,time) before sizing/placement
@@ -2913,3 +2914,4 @@ if showLowLevelTrace
 
 //if bar_index == 20253
 //    label.new(bar_index, high, "bar 26165 " + f_iso_local(time, tzInput), style=label.style_label_down, color=color.yellow, textcolor=color.black)
+
