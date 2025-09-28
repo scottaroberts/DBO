@@ -1,0 +1,2889 @@
+//@version=6
+strategy("DBO_Prod", shorttitle="DBO_Prod", overlay=true, calc_on_every_tick=true, process_orders_on_close=false, margin_long=0, margin_short=0)
+import adam_overton/TradersPostDeluxe/11 as tp
+
+//this version contains the fixes for the ghost trade issues. 
+
+// ──────────────────────────────────────────────────────────
+// 1) GLOBAL CONFIG
+// ────────────────────────────────────────────────────────
+string tzInput = input.string("America/Los_Angeles", "Time Zone", options = ["America/New_York", "America/Chicago", "America/Los_Angeles", "UTC", "Europe/London", "Asia/Tokyo"])
+showPnLIndicators = input.string("Yes", "Show Profit/Loss Indicators", options=["Yes", "No"], group="Display Settings")
+showDebugLabels = input.bool(false, "Show L1 Trade Labels", group="Display Settings")
+// Add below existing Display Settings inputs
+showOppositeDebugLabels = input.bool(false, "Show L2 Opposite Side Trade Labels", group="Display Settings")
+// Low-level counter-change tracing (independent of high-level debug labels)
+bool showLowLevelTrace = input.bool(false, "Show L3 Debug Low-Level Trace", group="Display Settings")
+showVWAPComponents = input.bool(false, "Show VWAP Plot", group="Display Settings")
+
+var bool resetTimes                     = true
+var string rangeSetSnapshot             = "3:10"
+var int rangeStart                      = na
+var int rangeEnd                        = na
+var int exitTime                        = na
+var bool scoped_officialRangeStarted    = false
+var int scoped_actualRangeStart         = na
+var int lastEntryBar                    = -1
+var bool sessionValid                   = true
+string sessionInvalidReason             = ""
+var bool issuedLongOrder                = false
+var bool issuedShortOrder               = false
+var bool drew                           = false
+var bool sessionBlocked                 = false
+var int  emergencyExitBar               = na
+var bool emergencyExitSent              = false
+var int lastIssuedTradeNumber           = 0
+var float sessionPL_snapshot            = na
+var int tradesToday_snapshot            = na
+var table sessionTable                  = na
+var int snapshotRangeStart              = na
+var bool earlyExitFired                 = false
+string vwapMode                         = "Session"
+int vwapLen                             = 14
+var int lastProfitLblBar = na
+var int lastExitEmitBar = na
+var int cycleSide = 0
+var int oppOutstanding = 0
+
+//debugging trade counting
+// === TRACE: order counter ===
+var int    lastIssuedTradeNumber_prev = lastIssuedTradeNumber
+var string lastIssuedTradeNumber_reason = ""
+
+
+// ───────────────────────────────────────────────────────────────
+// 2) SINGLE SESSION INPUTS
+// ───────────────────────────────────────────────────────────────
+riskDollars         = input.float(1000.0, "Per Session Risk Dollars", tooltip="Total amount to risk per trade if not session specfic defined")
+maxDailyLoss        = input.float(7000, title="Max Daily Loss", tooltip="Set to 0 for unlimited risk")
+int rangeEndHour        = input.int(3, "Range End Hour") 
+int rangeEndMin         = input.int(34, "Range End Min")
+int lookbackH           = input.int(4, "Lookback Hour") 
+int lookbackM           = input.int(0, "Lookback Min")
+int exitDurH            = input.int(9, "Exit Duration Hour")
+int exitDurM            = input.int(35, "Exit Duration Min")
+
+
+// ───────────────────────────────────────────────
+// 3.1) Entry/TP/SL and Opposite Trade Behavior (3-way)
+// ───────────────────────────────────────────────
+int tradeLimit          = input.int(3, "Max Set of Long+Short Orders", group="Trade Settings", tooltip="REMEMBER we will ALWAYS take the opposing trade, real # of trades could be 2x this number")
+float tpRatio           = input.float(0.56, "TP Ratio", step=0.01,group="Trade Settings")
+float entryOff          = input.float(12.0, "Entry Offset to enter trade", group="Trade Settings")
+float stopOff           = input.float(2.0, "Stop Offset to enter trade", group="Trade Settings")
+
+slType                  = input.string("RR", "Stop Loss Type", options=["RR","Points"], group="Trade Settings")
+float rrRatio           = input.float(1.7, "SL:TP Ratio/R:R Inverted", group="Trade Settings")
+float ptsSL             = input.float(14.0, "Stop Loss (pts)", group="Trade Settings")
+
+//Yes these two things should be combined but I was being lazy
+oppositeQtyMultiplier   = input.float(7.0, "Opposite Trade Quantity Multiplier", step=0.1, group="Recoup Trade Settings")
+oppositeReissueEntryOffsetPts = input.float(-1, "Opposite Reissue Entry Offset (pts)", step=0.25, group="Recoup Trade Settings",  tooltip="Set -1 to match the existing entries. Note that it's entry offset (12) - stop offset (2), so a 10 would match")
+oppositeTpOverride      = input.float(0.22, "Opposite Trade TP Override (-1 = default)", step=0.01, group="Recoup Trade Settings")
+// Proxy routing for opposite reissue (e.g., MYM → YM)
+// >>> CHANGE: user control to scale OppAdd stop distance vs original bracket
+float oppAddStopPct = input.float(75.0, "Opposite Add Stop % of Original", step = 1.0, minval = 1.0, maxval = 100.0, group = "Recoup Trade Settings")
+
+useProxyRealtimeOnly    = input.bool(true, "Proxy Ticker (YM vs MYM) For Alerts (Realtime Only)", group="Recoup Trade Settings")
+float proxyQtyMul       = input.float(0.10, "Proxy Qty Multiplier (YM≈10x MYM)", step=0.01, group="Recoup Trade Settings")
+
+// ───────────────────────────────────────────────────────────────
+// 3) RISK / HALT / BEHAVIOR
+// ───────────────────────────────────────────────────────────────
+midpointStartTolerancePct = input.float(35.0, "Midpoint Start Proximity (%)", group="Quality Filters", minval = -1, maxval = 100,tooltip="-1 default to use global setting")
+requireMidpointReturn = input.bool(true, "Require Midpoint Quality after Trade 1", group="Quality Filters")
+minimumOneContract  = input.bool(true, "Minimum One Contract", tooltip="Force at least one contract even if risk% yields 0")
+haltAfterProfit     = input.bool(false, "Halt Trading After Day is Green", tooltip="If we are green, stop trading, then exit")
+earlyExitMinutes    = input.int(10, "Early Exit Minutes Before Session End", minval=0, tooltip="If we are green right before session then exit")
+
+// ───────────────────────────────────────────────────────────────
+// 4) QUALITY FILTERS
+// ───────────────────────────────────────────────────────────────
+minRangePoints          = input.float(50, "Minimum Range Width (pts)", group="Quality Filters", tooltip="-1 default to disable")
+maxRangePoints          = input.float(350, "Maximum Range Width (pts)", group="Quality Filters", tooltip="-1 default to disable")
+
+
+// ────────────────
+// 4.3) News Filters (Severity 1/2/3)  // >>> CHANGE: replace Sev 3-only block with per-type, per-severity filters
+// ────────────────
+
+// Build the session date string (inclusive end alignment from your range model)
+// >>> CHANGE: use session date for all news checks (keeps prior behavior timing)
+string sessionDateStr = str.tostring(year(rangeEnd, tzInput)) + "-" + str.tostring(month(rangeEnd, tzInput), "00") + "-" + str.tostring(dayofmonth(rangeEnd, tzInput), "00")
+
+// ——— Inputs: grouped by Severity; per-type checkboxes alphabetized; unchecked = block day ———
+// ────────────────
+// News Inputs (with tooltips: Checked vs Unchecked behavior)
+// ────────────────
+// ——— Inputs: grouped by Severity; per-type checkboxes alphabetized; unchecked = block day ———
+// ────────────────
+// News Inputs (with tooltips: Checked vs Unchecked behavior)
+// ────────────────
+useSev3Filter = input.bool(true, "News: Default Blocked (Severity 3) Filter", group="News: Severity 3", tooltip="Checked: include Severity 3 events in blocking. Unchecked: ignore Severity 3 events (per-type toggles below have no effect).")
+allow_ADP_Non_Farm_Employment_Change = input.bool(false, "ADP Non-Farm Employment Change", group="News: Severity 3", tooltip="Checked: allow trading on ADP Non-Farm Employment Change days. Unchecked: block trading on ADP Non-Farm Employment Change days (if Severity 3 filter is enabled).")
+allow_Business_Inventories_m_m = input.bool(false, "Business Inventories m/m", group="News: Severity 3", tooltip="Checked: allow trading on Business Inventories m/m days. Unchecked: block trading on Business Inventories m/m days (if Severity 3 filter is enabled).")
+allow_CPI_y_y = input.bool(false, "CPI y/y", group="News: Severity 3", tooltip="Checked: allow trading on CPI y/y days. Unchecked: block trading on CPI y/y days (if Severity 3 filter is enabled).")
+allow_Capacity_Utilization_Rate = input.bool(false, "Capacity Utilization Rate", group="News: Severity 3", tooltip="Checked: allow trading on Capacity Utilization Rate days. Unchecked: block trading on Capacity Utilization Rate days (if Severity 3 filter is enabled).")
+allow_Core_Retail_Sales_m_m = input.bool(false, "Core Retail Sales m/m", group="News: Severity 3", tooltip="Checked: allow trading on Core Retail Sales m/m days. Unchecked: block trading on Core Retail Sales m/m days (if Severity 3 filter is enabled).")
+allow_FOMC_Meeting_Minutes = input.bool(false, "FOMC Meeting Minutes", group="News: Severity 3", tooltip="Checked: allow trading on FOMC Meeting Minutes days. Unchecked: block trading on FOMC Meeting Minutes days (if Severity 3 filter is enabled).")
+allow_Fed_Chair_Powell_Speaks = input.bool(false, "Fed Chair Powell Speaks", group="News: Severity 3", tooltip="Checked: allow trading on Fed Chair Powell Speaks days. Unchecked: block trading on Fed Chair Powell Speaks days (if Severity 3 filter is enabled).")
+allow_Final_GDP_q_q = input.bool(false, "Final GDP q/q", group="News: Severity 3", tooltip="Checked: allow trading on Final GDP q/q days. Unchecked: block trading on Final GDP q/q days (if Severity 3 filter is enabled).")
+allow_ISM_Manufacturing_PMI = input.bool(false, "ISM Manufacturing PMI", group="News: Severity 3", tooltip="Checked: allow trading on ISM Manufacturing PMI days. Unchecked: block trading on ISM Manufacturing PMI days (if Severity 3 filter is enabled).")
+allow_ISM_Services_PMI = input.bool(false, "ISM Services PMI", group="News: Severity 3", tooltip="Checked: allow trading on ISM Services PMI days. Unchecked: block trading on ISM Services PMI days (if Severity 3 filter is enabled).")
+allow_Industrial_Production_m_m = input.bool(false, "Industrial Production m/m", group="News: Severity 3", tooltip="Checked: allow trading on Industrial Production m/m days. Unchecked: block trading on Industrial Production m/m days (if Severity 3 filter is enabled).")
+allow_NAHB_Housing_Market_Index = input.bool(false, "NAHB Housing Market Index", group="News: Severity 3", tooltip="Checked: allow trading on NAHB Housing Market Index days. Unchecked: block trading on NAHB Housing Market Index days (if Severity 3 filter is enabled).")
+allow_Natural_Gas_Storage = input.bool(false, "Natural Gas Storage", group="News: Severity 3", tooltip="Checked: allow trading on Natural Gas Storage days. Unchecked: block trading on Natural Gas Storage days (if Severity 3 filter is enabled).")
+allow_Philly_Fed_Manufacturing_Index = input.bool(false, "Philly Fed Manufacturing Index", group="News: Severity 3", tooltip="Checked: allow trading on Philly Fed Manufacturing Index days. Unchecked: block trading on Philly Fed Manufacturing Index days (if Severity 3 filter is enabled).")
+allow_Retail_Sales_m_m = input.bool(false, "Retail Sales m/m", group="News: Severity 3", tooltip="Checked: allow trading on Retail Sales m/m days. Unchecked: block trading on Retail Sales m/m days (if Severity 3 filter is enabled).")
+allow_Unemployment_Claims = input.bool(false, "Unemployment Claims", group="News: Severity 3", tooltip="Checked: allow trading on Unemployment Claims days. Unchecked: block trading on Unemployment Claims days (if Severity 3 filter is enabled).")
+
+useSev2Filter = input.bool(false, "News: Severity 2 Placeholder", group="News: Severity 2", tooltip="Checked: include Severity 2 events in blocking. Unchecked: ignore Severity 2 events (per-type toggles below have no effect).")
+
+useSev1Filter = input.bool(false, "News: Default Trade (Severity 1)", group="News: Severity 1", tooltip="Checked: include Severity 1 events in blocking. Unchecked: ignore Severity 1 events (per-type toggles below have no effect).")
+allow_Advance_GDP_q_q = input.bool(false, "Advance GDP q/q", group="News: Severity 1", tooltip="Checked: allow trading on Advance GDP q/q days. Unchecked: block trading on Advance GDP q/q days (if Severity 1 filter is enabled).")
+allow_Average_Hourly_Earnings_m_m = input.bool(false, "Average Hourly Earnings m/m", group="News: Severity 1", tooltip="Checked: allow trading on Average Hourly Earnings m/m days. Unchecked: block trading on Average Hourly Earnings m/m days (if Severity 1 filter is enabled).")
+allow_CPI_m_m = input.bool(false, "CPI m/m", group="News: Severity 1", tooltip="Checked: allow trading on CPI m/m days. Unchecked: block trading on CPI m/m days (if Severity 1 filter is enabled).")
+allow_Core_CPI_m_m = input.bool(false, "Core CPI m/m", group="News: Severity 1", tooltip="Checked: allow trading on Core CPI m/m days. Unchecked: block trading on Core CPI m/m days (if Severity 1 filter is enabled).")
+allow_Core_PCE_Price_Index_m_m = input.bool(false, "Core PCE Price Index m/m", group="News: Severity 1", tooltip="Checked: allow trading on Core PCE Price Index m/m days. Unchecked: block trading on Core PCE Price Index m/m days (if Severity 1 filter is enabled).")
+allow_Core_PPI_m_m = input.bool(false, "Core PPI m/m", group="News: Severity 1", tooltip="Checked: allow trading on Core PPI m/m days. Unchecked: block trading on Core PPI m/m days (if Severity 1 filter is enabled).")
+allow_Crude_Oil_Inventories = input.bool(false, "Crude Oil Inventories", group="News: Severity 1", tooltip="Checked: allow trading on Crude Oil Inventories days. Unchecked: block trading on Crude Oil Inventories days (if Severity 1 filter is enabled).")
+allow_Employment_Cost_Index_q_q = input.bool(false, "Employment Cost Index q/q", group="News: Severity 1", tooltip="Checked: allow trading on Employment Cost Index q/q days. Unchecked: block trading on Employment Cost Index q/q days (if Severity 1 filter is enabled).")
+allow_Existing_Home_Sales = input.bool(false, "Existing Home Sales", group="News: Severity 1", tooltip="Checked: allow trading on Existing Home Sales days. Unchecked: block trading on Existing Home Sales days (if Severity 1 filter is enabled).")
+allow_Fed_Chair_Powell_Testifies  = input.bool(false, "Fed Chair Testifies", group="News: Severity 1", tooltip="Checked: allow trading on days when Fed Chair is testifies. Unchecked: block trading on Existing Home Sales days (if Severity 1 filter is enabled).")
+allow_FOMC_Economic_Projections = input.bool(false, "FOMC Economic Projections", group="News: Severity 1", tooltip="Checked: allow trading on FOMC Economic Projections days. Unchecked: block trading on FOMC Economic Projections days (if Severity 1 filter is enabled).")
+allow_FOMC_Press_Conference = input.bool(false, "FOMC Press Conference", group="News: Severity 1", tooltip="Checked: allow trading on FOMC Press Conference days. Unchecked: block trading on FOMC Press Conference days (if Severity 1 filter is enabled).")
+allow_FOMC_Statement = input.bool(false, "FOMC Statement", group="News: Severity 1", tooltip="Checked: allow trading on FOMC Statement days. Unchecked: block trading on FOMC Statement days (if Severity 1 filter is enabled).")
+allow_Federal_Funds_Rate = input.bool(false, "Federal Funds Rate", group="News: Severity 1", tooltip="Checked: allow trading on Federal Funds Rate days. Unchecked: block trading on Federal Funds Rate days (if Severity 1 filter is enabled).")
+allow_Flash_Manufacturing_PMI = input.bool(false, "Flash Manufacturing PMI", group="News: Severity 1", tooltip="Checked: allow trading on Flash Manufacturing PMI days. Unchecked: block trading on Flash Manufacturing PMI days (if Severity 1 filter is enabled).")
+allow_Flash_Services_PMI = input.bool(false, "Flash Services PMI", group="News: Severity 1", tooltip="Checked: allow trading on Flash Services PMI days. Unchecked: block trading on Flash Services PMI days (if Severity 1 filter is enabled).")
+allow_JOLTS_Job_Openings = input.bool(false, "JOLTS Job Openings", group="News: Severity 1", tooltip="Checked: allow trading on JOLTS Job Openings days. Unchecked: block trading on JOLTS Job Openings days (if Severity 1 filter is enabled).")
+allow_Jackson_Hole_Symposium = input.bool(false, "Jackson Hole Symposium", group="News: Severity 1", tooltip="Checked: allow trading on Jackson Hole Symposium days. Unchecked: block trading on Jackson Hole Symposium days (if Severity 1 filter is enabled).")
+allow_Non_Farm_Employment_Change = input.bool(false, "Non-Farm Employment Change", group="News: Severity 1", tooltip="Checked: allow trading on Non-Farm Employment Change days. Unchecked: block trading on Non-Farm Employment Change days (if Severity 1 filter is enabled).")
+allow_PPI_m_m = input.bool(false, "PPI m/m", group="News: Severity 1", tooltip="Checked: allow trading on PPI m/m days. Unchecked: block trading on PPI m/m days (if Severity 1 filter is enabled).")
+allow_Personal_Income_m_m = input.bool(false, "Personal Income m/m", group="News: Severity 1", tooltip="Checked: allow trading on Personal Income m/m days. Unchecked: block trading on Personal Income m/m days (if Severity 1 filter is enabled).")
+allow_Personal_Spending_m_m = input.bool(false, "Personal Spending m/m", group="News: Severity 1", tooltip="Checked: allow trading on Personal Spending m/m days. Unchecked: block trading on Personal Spending m/m days (if Severity 1 filter is enabled).")
+allow_Prelim_GDP_q_q = input.bool(false, "Prelim GDP q/q", group="News: Severity 1", tooltip="Checked: allow trading on Prelim GDP q/q days. Unchecked: block trading on Prelim GDP q/q days (if Severity 1 filter is enabled).")
+allow_Prelim_UoM_Consumer_Sentiment = input.bool(false, "Prelim UoM Consumer Sentiment", group="News: Severity 1", tooltip="Checked: allow trading on Prelim UoM Consumer Sentiment days. Unchecked: block trading on Prelim UoM Consumer Sentiment days (if Severity 1 filter is enabled).")
+allow_Prelim_UoM_Inflation_Expectations = input.bool(false, "Prelim UoM Inflation Expectations", group="News: Severity 1", tooltip="Checked: allow trading on Prelim UoM Inflation Expectations days. Unchecked: block trading on Prelim UoM Inflation Expectations days (if Severity 1 filter is enabled).")
+allow_President_Trump_Speaks = input.bool(false, "President Trump Speaks", group="News: Severity 1", tooltip="Checked: allow trading on President Trump Speaks days. Unchecked: block trading on President Trump Speaks days (if Severity 1 filter is enabled).")
+allow_Revised_UoM_Consumer_Sentiment = input.bool(false, "Revised UoM Consumer Sentiment", group="News: Severity 1", tooltip="Checked: allow trading on Revised UoM Consumer Sentiment days. Unchecked: block trading on Revised UoM Consumer Sentiment days (if Severity 1 filter is enabled).")
+allow_Revised_UoM_Inflation_Expectations = input.bool(false, "Revised UoM Inflation Expectations", group="News: Severity 1", tooltip="Checked: allow trading on Revised UoM Inflation Expectations days. Unchecked: block trading on Revised UoM Inflation Expectations days (if Severity 1 filter is enabled).")
+allow_Unemployment_Rate = input.bool(false, "Unemployment Rate", group="News: Severity 1", tooltip="Checked: allow trading on Unemployment Rate days. Unchecked: block trading on Unemployment Rate days (if Severity 1 filter is enabled).")
+
+// ——— Stable TypeId map (0-based) used by the unified table ———
+// >>> CHANGE: Appended new types from authoritative severity list; preserved existing 0..32 IDs.
+int TYPE_CPI_m_m = 0
+int TYPE_CPI_y_y = 1
+int TYPE_Core_CPI_m_m = 2
+int TYPE_Core_PPI_m_m = 3
+int TYPE_FOMC_Economic_Projections = 4
+int TYPE_FOMC_Meeting_Minutes = 5
+int TYPE_Federal_Funds_Rate = 6
+int TYPE_ISM_Manufacturing_PMI = 7
+int TYPE_ISM_Services_PMI = 8
+int TYPE_Non_Farm_Employment_Change = 9
+int TYPE_PPI_m_m = 10
+int TYPE_President_Trump_Speaks = 11
+int TYPE_Unemployment_Rate = 12
+int TYPE_Core_PCE_Price_Index_m_m = 13
+int TYPE_Core_Retail_Sales_m_m = 14
+int TYPE_FOMC_Press_Conference = 15
+int TYPE_FOMC_Statement = 16
+int TYPE_Fed_Chair_Powell_Speaks = 17
+int TYPE_Fed_Chair_Powell_Testifies = 18
+int TYPE_Retail_Sales_m_m = 19
+int TYPE_ADP_Non_Farm_Employment_Change = 20
+int TYPE_Advance_GDP_q_q = 21
+int TYPE_Average_Hourly_Earnings_m_m = 22
+int TYPE_Employment_Cost_Index_q_q = 23
+int TYPE_Final_GDP_q_q = 24
+int TYPE_Flash_Manufacturing_PMI = 25
+int TYPE_Flash_Services_PMI = 26
+int TYPE_JOLTS_Job_Openings = 27
+int TYPE_Jackson_Hole_Symposium = 28
+int TYPE_Prelim_GDP_q_q = 29
+int TYPE_Prelim_UoM_Consumer_Sentiment = 30
+int TYPE_Prelim_UoM_Inflation_Expectations = 31
+int TYPE_Unemployment_Claims = 32
+int TYPE_Business_Inventories_m_m = 33
+int TYPE_Capacity_Utilization_Rate = 34
+int TYPE_Crude_Oil_Inventories = 35
+int TYPE_Existing_Home_Sales = 36
+int TYPE_Industrial_Production_m_m = 37
+int TYPE_NAHB_Housing_Market_Index = 38
+int TYPE_Natural_Gas_Storage = 39
+int TYPE_Personal_Spending_m_m = 40
+int TYPE_Personal_Income_m_m = 41
+int TYPE_Philly_Fed_Manufacturing_Index = 42
+int TYPE_Revised_UoM_Inflation_Expectations = 43
+int TYPE_Revised_UoM_Consumer_Sentiment = 44
+
+
+// ——— Unified event table (parallel arrays). Times kept for Stage-2 deferral. ———
+var arrDateStr = array.new_string()
+var arrTimeMS = array.new_int()
+var arrSeverity = array.new_int()
+var arrTypeId = array.new_int()
+
+// Per-type “Allow trading” lookup (index == TypeId)
+var allowByTypeId = array.new_bool()
+// >>> CHANGE: declare per-type severity map at top level (visible outside init block)
+var typeSevByTypeId = array.new_int()
+
+
+if bar_index == 0
+    // Reset inits
+    array.clear(arrDateStr)
+    array.clear(arrTimeMS)
+    array.clear(arrSeverity)
+    array.clear(arrTypeId)
+    array.clear(allowByTypeId)
+
+    // >>> CHANGE: BEGIN allowByTypeId pushes (neutral type names; indices unchanged)
+    array.push(allowByTypeId, allow_CPI_m_m)
+    array.push(allowByTypeId, allow_CPI_y_y)
+    array.push(allowByTypeId, allow_Core_CPI_m_m)
+    array.push(allowByTypeId, allow_Core_PPI_m_m)
+    array.push(allowByTypeId, allow_FOMC_Economic_Projections)
+    array.push(allowByTypeId, allow_FOMC_Meeting_Minutes)
+    array.push(allowByTypeId, allow_Federal_Funds_Rate)
+    array.push(allowByTypeId, allow_ISM_Manufacturing_PMI)
+    array.push(allowByTypeId, allow_ISM_Services_PMI)
+    array.push(allowByTypeId, allow_Non_Farm_Employment_Change)
+    array.push(allowByTypeId, allow_PPI_m_m)
+    array.push(allowByTypeId, allow_President_Trump_Speaks)         // was _Sev3
+    array.push(allowByTypeId, allow_Unemployment_Rate)              // was _Sev3
+    array.push(allowByTypeId, allow_Core_PCE_Price_Index_m_m)
+    array.push(allowByTypeId, allow_Core_Retail_Sales_m_m)
+    array.push(allowByTypeId, allow_FOMC_Press_Conference)
+    array.push(allowByTypeId, allow_FOMC_Statement)
+    array.push(allowByTypeId, allow_Fed_Chair_Powell_Speaks)
+    array.push(allowByTypeId, allow_Fed_Chair_Powell_Testifies)
+    array.push(allowByTypeId, allow_Retail_Sales_m_m)
+    array.push(allowByTypeId, allow_ADP_Non_Farm_Employment_Change)
+    array.push(allowByTypeId, allow_Advance_GDP_q_q)
+    array.push(allowByTypeId, allow_Average_Hourly_Earnings_m_m)
+    array.push(allowByTypeId, allow_Employment_Cost_Index_q_q)
+    array.push(allowByTypeId, allow_Final_GDP_q_q)
+    array.push(allowByTypeId, allow_Flash_Manufacturing_PMI)
+    array.push(allowByTypeId, allow_Flash_Services_PMI)
+    array.push(allowByTypeId, allow_JOLTS_Job_Openings)
+    array.push(allowByTypeId, allow_Jackson_Hole_Symposium)
+    array.push(allowByTypeId, allow_Prelim_GDP_q_q)
+    array.push(allowByTypeId, allow_Prelim_UoM_Consumer_Sentiment)
+    array.push(allowByTypeId, allow_Prelim_UoM_Inflation_Expectations)
+    array.push(allowByTypeId, allow_Unemployment_Claims)
+    array.push(allowByTypeId, allow_Business_Inventories_m_m)
+    array.push(allowByTypeId, allow_Capacity_Utilization_Rate)
+    array.push(allowByTypeId, allow_Crude_Oil_Inventories)
+    array.push(allowByTypeId, allow_Existing_Home_Sales)
+    array.push(allowByTypeId, allow_Industrial_Production_m_m)
+    array.push(allowByTypeId, allow_NAHB_Housing_Market_Index)
+    array.push(allowByTypeId, allow_Natural_Gas_Storage)
+    array.push(allowByTypeId, allow_Personal_Spending_m_m)
+    array.push(allowByTypeId, allow_Personal_Income_m_m)
+    array.push(allowByTypeId, allow_Philly_Fed_Manufacturing_Index)
+    array.push(allowByTypeId, allow_Revised_UoM_Inflation_Expectations)
+    array.push(allowByTypeId, allow_Revised_UoM_Consumer_Sentiment)
+    // >>> CHANGE: END allowByTypeId pushes
+
+    // >>> CHANGE: BEGIN typeSevByTypeId (Type → Severity map; indices 0..32 must match TypeId map)
+    if array.size(typeSevByTypeId) == 0
+        array.push(typeSevByTypeId, 3)  // 0  TYPE_CPI_m_m
+        array.push(typeSevByTypeId, 3)  // 1  TYPE_CPI_y_y
+        array.push(typeSevByTypeId, 3)  // 2  TYPE_Core_CPI_m_m
+        array.push(typeSevByTypeId, 1)  // 3  TYPE_Core_PPI_m_m // >>> CHANGE: align with new Severity 1
+        array.push(typeSevByTypeId, 1)  // 4  TYPE_FOMC_Economic_Projections // >>> CHANGE: align with new Severity 1
+        array.push(typeSevByTypeId, 3)  // 5  TYPE_FOMC_Meeting_Minutes
+        array.push(typeSevByTypeId, 1)  // 6  TYPE_Federal_Funds_Rate // >>> CHANGE: align with new Severity 1
+        array.push(typeSevByTypeId, 3)  // 7  TYPE_ISM_Manufacturing_PMI
+        array.push(typeSevByTypeId, 3)  // 8  TYPE_ISM_Services_PMI
+        array.push(typeSevByTypeId, 1)  // 9  TYPE_Non_Farm_Employment_Change // >>> CHANGE: align with new Severity 1
+        array.push(typeSevByTypeId, 1)  // 10 TYPE_PPI_m_m // >>> CHANGE: align with new Severity 1
+        array.push(typeSevByTypeId, 1)  // 11 TYPE_President_Trump_Speaks
+        array.push(typeSevByTypeId, 1)  // 12 TYPE_Unemployment_Rate
+        array.push(typeSevByTypeId, 1)  // 13 TYPE_Core_PCE_Price_Index_m_m // >>> CHANGE: was 2 → 1
+        array.push(typeSevByTypeId, 1)  // 14 TYPE_Core_Retail_Sales_m_m // >>> CHANGE: was 2 → 1
+        array.push(typeSevByTypeId, 1)  // 15 TYPE_FOMC_Press_Conference // >>> CHANGE: align with new Severity 1
+        array.push(typeSevByTypeId, 1)  // 16 TYPE_FOMC_Statement // >>> CHANGE: align with new Severity 1
+        array.push(typeSevByTypeId, 3)  // 17 TYPE_Fed_Chair_Powell_Speaks // >>> CHANGE: was 2 → 3
+        array.push(typeSevByTypeId, 1)  // 18 TYPE_Fed_Chair_Powell_Testifies // >>> CHANGE: align with new Severity 1
+        array.push(typeSevByTypeId, 1)  // 19 TYPE_Retail_Sales_m_m // >>> CHANGE: was 2 → 1
+        array.push(typeSevByTypeId, 3)  // 20 TYPE_ADP_Non_Farm_Employment_Change // >>> CHANGE: align with new Severity 3
+        array.push(typeSevByTypeId, 1)  // 21 TYPE_Advance_GDP_q_q
+        array.push(typeSevByTypeId, 1)  // 22 TYPE_Average_Hourly_Earnings_m_m
+        array.push(typeSevByTypeId, 1)  // 23 TYPE_Employment_Cost_Index_q_q
+        array.push(typeSevByTypeId, 1)  // 24 TYPE_Final_GDP_q_q
+        array.push(typeSevByTypeId, 1)  // 25 TYPE_Flash_Manufacturing_PMI
+        array.push(typeSevByTypeId, 1)  // 26 TYPE_Flash_Services_PMI
+        array.push(typeSevByTypeId, 3)  // 27 TYPE_JOLTS_Job_Openings // >>> CHANGE: align with new Severity 3
+        array.push(typeSevByTypeId, 1)  // 28 TYPE_Jackson_Hole_Symposium
+        array.push(typeSevByTypeId, 1)  // 29 TYPE_Prelim_GDP_q_q
+        array.push(typeSevByTypeId, 1)  // 30 TYPE_Prelim_UoM_Consumer_Sentiment
+        array.push(typeSevByTypeId, 1)  // 31 TYPE_Prelim_UoM_Inflation_Expectations
+        array.push(typeSevByTypeId, 3)  // 32 TYPE_Unemployment_Claims // >>> CHANGE: align with new Severity 3
+        // >>> CHANGE: appended new types 33..44 per authoritative list; IDs unchanged
+        array.push(typeSevByTypeId, 3)  // 33 TYPE_Business_Inventories_m_m
+        array.push(typeSevByTypeId, 3)  // 34 TYPE_Capacity_Utilization_Rate
+        array.push(typeSevByTypeId, 1)  // 35 TYPE_Crude_Oil_Inventories
+        array.push(typeSevByTypeId, 1)  // 36 TYPE_Existing_Home_Sales
+        array.push(typeSevByTypeId, 3)  // 37 TYPE_Industrial_Production_m_m
+        array.push(typeSevByTypeId, 3)  // 38 TYPE_NAHB_Housing_Market_Index
+        array.push(typeSevByTypeId, 3)  // 39 TYPE_Natural_Gas_Storage
+        array.push(typeSevByTypeId, 1)  // 40 TYPE_Personal_Spending_m_m
+        array.push(typeSevByTypeId, 1)  // 41 TYPE_Personal_Income_m_m
+        array.push(typeSevByTypeId, 3)  // 42 TYPE_Philly_Fed_Manufacturing_Index
+        array.push(typeSevByTypeId, 1)  // 43 TYPE_Revised_UoM_Inflation_Expectations
+        array.push(typeSevByTypeId, 1)  // 44 TYPE_Revised_UoM_Consumer_Sentiment
+    // >>> CHANGE: END typeSevByTypeId
+
+    // ────────────────
+    // NEWS ROWS
+    // ────────────────
+   // >>> CHANGE: BEGIN GENERATED NEWS EVENT ROWS — 2025-06 (date, timeMS, typeId only)
+    array.push(arrDateStr, "2025-06-02")
+    array.push(arrTimeMS, 14400000)
+    array.push(arrTypeId, TYPE_ISM_Manufacturing_PMI)
+
+    array.push(arrDateStr, "2025-06-02")
+    array.push(arrTimeMS, 14400000)
+    array.push(arrTypeId, TYPE_JOLTS_Job_Openings)
+
+    array.push(arrDateStr, "2025-06-03")
+    array.push(arrTimeMS, 25200000)
+    array.push(arrTypeId, TYPE_Fed_Chair_Powell_Speaks)
+
+    array.push(arrDateStr, "2025-06-04")
+    array.push(arrTimeMS, 8100000)
+    array.push(arrTypeId, TYPE_ADP_Non_Farm_Employment_Change)
+
+    array.push(arrDateStr, "2025-06-04")
+    array.push(arrTimeMS, 14400000)
+    array.push(arrTypeId, TYPE_ISM_Services_PMI)
+
+    array.push(arrDateStr, "2025-06-05")
+    array.push(arrTimeMS, 9000000)
+    array.push(arrTypeId, TYPE_Unemployment_Claims)
+
+    array.push(arrDateStr, "2025-06-06")
+    array.push(arrTimeMS, 9000000)
+    array.push(arrTypeId, TYPE_Average_Hourly_Earnings_m_m)
+
+    array.push(arrDateStr, "2025-06-06")
+    array.push(arrTimeMS, 9000000)
+    array.push(arrTypeId, TYPE_Non_Farm_Employment_Change)
+
+    array.push(arrDateStr, "2025-06-06")
+    array.push(arrTimeMS, 9000000)
+    array.push(arrTypeId, TYPE_Unemployment_Rate)
+
+    array.push(arrDateStr, "2025-06-11")
+    array.push(arrTimeMS, 9000000)
+    array.push(arrTypeId, TYPE_Core_CPI_m_m)
+
+    array.push(arrDateStr, "2025-06-11")
+    array.push(arrTimeMS, 9000000)
+    array.push(arrTypeId, TYPE_CPI_m_m)
+
+    array.push(arrDateStr, "2025-06-11")
+    array.push(arrTimeMS, 9000000)
+    array.push(arrTypeId, TYPE_CPI_y_y)
+
+    array.push(arrDateStr, "2025-06-12")
+    array.push(arrTimeMS, 11040000)
+    array.push(arrTypeId, TYPE_PPI_m_m)
+
+    array.push(arrDateStr, "2025-06-12")
+    array.push(arrTimeMS, 11040000)
+    array.push(arrTypeId, TYPE_Core_PPI_m_m)
+
+    array.push(arrDateStr, "2025-06-13")
+    array.push(arrTimeMS, 11040000)
+    array.push(arrTypeId, TYPE_Retail_Sales_m_m)
+
+    array.push(arrDateStr, "2025-06-13")
+    array.push(arrTimeMS, 11040000)
+    array.push(arrTypeId, TYPE_Core_Retail_Sales_m_m)
+
+    array.push(arrDateStr, "2025-06-18")
+    array.push(arrTimeMS, 28800000)
+    array.push(arrTypeId, TYPE_Federal_Funds_Rate)
+
+    array.push(arrDateStr, "2025-06-18")
+    array.push(arrTimeMS, 28800000)
+    array.push(arrTypeId, TYPE_FOMC_Statement)
+
+    array.push(arrDateStr, "2025-06-18")
+    array.push(arrTimeMS, 30600000)
+    array.push(arrTypeId, TYPE_FOMC_Press_Conference)
+
+    array.push(arrDateStr, "2025-06-18")
+    array.push(arrTimeMS, 28800000)
+    array.push(arrTypeId, TYPE_FOMC_Economic_Projections)
+
+    array.push(arrDateStr, "2025-06-20")
+    array.push(arrTimeMS, 11040000)
+    array.push(arrTypeId, TYPE_Prelim_GDP_q_q)
+
+    array.push(arrDateStr, "2025-06-21")
+    array.push(arrTimeMS, 57600000)
+    array.push(arrTypeId, TYPE_President_Trump_Speaks)
+
+    array.push(arrDateStr, "2025-06-23")
+    array.push(arrTimeMS, 13500000)
+    array.push(arrTypeId, TYPE_Flash_Manufacturing_PMI)
+
+    array.push(arrDateStr, "2025-06-23")
+    array.push(arrTimeMS, 13500000)
+    array.push(arrTypeId, TYPE_Flash_Services_PMI)
+
+    array.push(arrDateStr, "2025-06-24")
+    array.push(arrTimeMS, 14400000)
+    array.push(arrTypeId, TYPE_Fed_Chair_Powell_Testifies)
+
+    array.push(arrDateStr, "2025-06-25")
+    array.push(arrTimeMS, 14400000)
+    array.push(arrTypeId, TYPE_Fed_Chair_Powell_Testifies)
+
+    array.push(arrDateStr, "2025-06-26")
+    array.push(arrTimeMS, 9000000)
+    array.push(arrTypeId, TYPE_Final_GDP_q_q)
+
+    array.push(arrDateStr, "2025-06-26")
+    array.push(arrTimeMS, 9000000)
+    array.push(arrTypeId, TYPE_Unemployment_Claims)
+
+    array.push(arrDateStr, "2025-06-27")
+    array.push(arrTimeMS, 9000000)
+    array.push(arrTypeId, TYPE_Core_PCE_Price_Index_m_m)
+    // >>> CHANGE: END GENERATED NEWS EVENT ROWS — 2025-06
+    // >>> CHANGE: BEGIN GENERATED NEWS EVENT ROWS — 2025-07 (date, timeMS, typeId only)
+    array.push(arrDateStr, "2025-07-01")
+    array.push(arrTimeMS, 12600000)
+    array.push(arrTypeId, TYPE_Fed_Chair_Powell_Speaks)
+
+    array.push(arrDateStr, "2025-07-01")
+    array.push(arrTimeMS, 14400000)
+    array.push(arrTypeId, TYPE_ISM_Manufacturing_PMI)
+
+    array.push(arrDateStr, "2025-07-01")
+    array.push(arrTimeMS, 14400000)
+    array.push(arrTypeId, TYPE_JOLTS_Job_Openings)
+
+    array.push(arrDateStr, "2025-07-02")
+    array.push(arrTimeMS, 8100000)
+    array.push(arrTypeId, TYPE_ADP_Non_Farm_Employment_Change)
+
+    array.push(arrDateStr, "2025-07-03")
+    array.push(arrTimeMS, 9000000)
+    array.push(arrTypeId, TYPE_Average_Hourly_Earnings_m_m)
+
+    array.push(arrDateStr, "2025-07-03")
+    array.push(arrTimeMS, 9000000)
+    array.push(arrTypeId, TYPE_Non_Farm_Employment_Change)
+
+    array.push(arrDateStr, "2025-07-03")
+    array.push(arrTimeMS, 9000000)
+    array.push(arrTypeId, TYPE_Unemployment_Rate)
+
+    array.push(arrDateStr, "2025-07-03")
+    array.push(arrTimeMS, 14400000)
+    array.push(arrTypeId, TYPE_ISM_Services_PMI)
+
+    array.push(arrDateStr, "2025-07-09")
+    array.push(arrTimeMS, 28800000)
+    array.push(arrTypeId, TYPE_FOMC_Meeting_Minutes)
+
+    array.push(arrDateStr, "2025-07-10")
+    array.push(arrTimeMS, 9000000)
+    array.push(arrTypeId, TYPE_Unemployment_Claims)
+
+    array.push(arrDateStr, "2025-07-15")
+    array.push(arrTimeMS, 9000000)
+    array.push(arrTypeId, TYPE_CPI_m_m)
+
+    array.push(arrDateStr, "2025-07-15")
+    array.push(arrTimeMS, 9000000)
+    array.push(arrTypeId, TYPE_CPI_y_y)
+
+    array.push(arrDateStr, "2025-07-15")
+    array.push(arrTimeMS, 9000000)
+    array.push(arrTypeId, TYPE_Core_CPI_m_m)
+
+    array.push(arrDateStr, "2025-07-16")
+    array.push(arrTimeMS, 9000000)
+    array.push(arrTypeId, TYPE_Core_PPI_m_m)
+
+    array.push(arrDateStr, "2025-07-16")
+    array.push(arrTimeMS, 9000000)
+    array.push(arrTypeId, TYPE_PPI_m_m)
+
+    array.push(arrDateStr, "2025-07-17")
+    array.push(arrTimeMS, 9000000)
+    array.push(arrTypeId, TYPE_Core_Retail_Sales_m_m)
+
+    array.push(arrDateStr, "2025-07-17")
+    array.push(arrTimeMS, 9000000)
+    array.push(arrTypeId, TYPE_Retail_Sales_m_m)
+
+    array.push(arrDateStr, "2025-07-17")
+    array.push(arrTimeMS, 9000000)
+    array.push(arrTypeId, TYPE_Unemployment_Claims)
+
+    array.push(arrDateStr, "2025-07-24")
+    array.push(arrTimeMS, 9000000)
+    array.push(arrTypeId, TYPE_Unemployment_Claims)
+
+    array.push(arrDateStr, "2025-07-24")
+    array.push(arrTimeMS, 13500000)
+    array.push(arrTypeId, TYPE_Flash_Manufacturing_PMI)
+
+    array.push(arrDateStr, "2025-07-24")
+    array.push(arrTimeMS, 13500000)
+    array.push(arrTypeId, TYPE_Flash_Services_PMI)
+
+    array.push(arrDateStr, "2025-07-29")
+    array.push(arrTimeMS, 14400000)
+    array.push(arrTypeId, TYPE_JOLTS_Job_Openings)
+
+    array.push(arrDateStr, "2025-07-30")
+    array.push(arrTimeMS, 8100000)
+    array.push(arrTypeId, TYPE_ADP_Non_Farm_Employment_Change)
+
+    array.push(arrDateStr, "2025-07-30")
+    array.push(arrTimeMS, 9000000)
+    array.push(arrTypeId, TYPE_Advance_GDP_q_q)
+
+    array.push(arrDateStr, "2025-07-30")
+    array.push(arrTimeMS, 28800000)
+    array.push(arrTypeId, TYPE_FOMC_Statement)
+
+    array.push(arrDateStr, "2025-07-30")
+    array.push(arrTimeMS, 28800000)
+    array.push(arrTypeId, TYPE_Federal_Funds_Rate)
+
+    array.push(arrDateStr, "2025-07-30")
+    array.push(arrTimeMS, 30600000)
+    array.push(arrTypeId, TYPE_FOMC_Press_Conference)
+
+    array.push(arrDateStr, "2025-07-31")
+    array.push(arrTimeMS, 9000000)
+    array.push(arrTypeId, TYPE_Core_PCE_Price_Index_m_m)
+
+    array.push(arrDateStr, "2025-07-31")
+    array.push(arrTimeMS, 9000000)
+    array.push(arrTypeId, TYPE_Employment_Cost_Index_q_q)
+
+    array.push(arrDateStr, "2025-07-31")
+    array.push(arrTimeMS, 9000000)
+    array.push(arrTypeId, TYPE_Unemployment_Claims)
+    // >>> CHANGE: END GENERATED NEWS EVENT ROWS — 2025-07
+    // >>> CHANGE: BEGIN GENERATED NEWS EVENT ROWS — 2025-08 (date, timeMS, typeId only)
+    array.push(arrDateStr, "2025-08-01")
+    array.push(arrTimeMS, 9000000)
+    array.push(arrTypeId, TYPE_Average_Hourly_Earnings_m_m)
+
+    array.push(arrDateStr, "2025-08-01")
+    array.push(arrTimeMS, 9000000)
+    array.push(arrTypeId, TYPE_Non_Farm_Employment_Change)
+
+    array.push(arrDateStr, "2025-08-01")
+    array.push(arrTimeMS, 9000000)
+    array.push(arrTypeId, TYPE_Unemployment_Rate)
+
+    array.push(arrDateStr, "2025-08-01")
+    array.push(arrTimeMS, 14400000)
+    array.push(arrTypeId, TYPE_ISM_Manufacturing_PMI)
+
+    array.push(arrDateStr, "2025-08-05")
+    array.push(arrTimeMS, 14400000)
+    array.push(arrTypeId, TYPE_ISM_Services_PMI)
+
+    array.push(arrDateStr, "2025-08-07")
+    array.push(arrTimeMS, 9000000)
+    array.push(arrTypeId, TYPE_Unemployment_Claims)
+
+    array.push(arrDateStr, "2025-08-12")
+    array.push(arrTimeMS, 9000000)
+    array.push(arrTypeId, TYPE_Core_CPI_m_m)
+
+    array.push(arrDateStr, "2025-08-12")
+    array.push(arrTimeMS, 9000000)
+    array.push(arrTypeId, TYPE_CPI_m_m)
+
+    array.push(arrDateStr, "2025-08-12")
+    array.push(arrTimeMS, 9000000)
+    array.push(arrTypeId, TYPE_CPI_y_y)
+
+    array.push(arrDateStr, "2025-08-14")
+    array.push(arrTimeMS, 9000000)
+    array.push(arrTypeId, TYPE_Core_PPI_m_m)
+
+    array.push(arrDateStr, "2025-08-14")
+    array.push(arrTimeMS, 9000000)
+    array.push(arrTypeId, TYPE_PPI_m_m)
+
+    array.push(arrDateStr, "2025-08-14")
+    array.push(arrTimeMS, 9000000)
+    array.push(arrTypeId, TYPE_Unemployment_Claims)
+
+    array.push(arrDateStr, "2025-08-15")
+    array.push(arrTimeMS, 9000000)
+    array.push(arrTypeId, TYPE_Core_Retail_Sales_m_m)
+
+    array.push(arrDateStr, "2025-08-15")
+    array.push(arrTimeMS, 9000000)
+    array.push(arrTypeId, TYPE_Retail_Sales_m_m)
+
+    array.push(arrDateStr, "2025-08-15")
+    array.push(arrTimeMS, 14400000)
+    array.push(arrTypeId, TYPE_Prelim_UoM_Consumer_Sentiment)
+
+    array.push(arrDateStr, "2025-08-15")
+    array.push(arrTimeMS, 14400000)
+    array.push(arrTypeId, TYPE_Prelim_UoM_Inflation_Expectations)
+
+    array.push(arrDateStr, "2025-08-15")
+    array.push(arrTimeMS, 46500000)
+    array.push(arrTypeId, TYPE_President_Trump_Speaks)
+
+    array.push(arrDateStr, "2025-08-20")
+    array.push(arrTimeMS, 28800000)
+    array.push(arrTypeId, TYPE_FOMC_Meeting_Minutes)
+
+    array.push(arrDateStr, "2025-08-21")
+    array.push(arrTimeMS, 9000000)
+    array.push(arrTypeId, TYPE_Unemployment_Claims)
+
+    array.push(arrDateStr, "2025-08-21")
+    array.push(arrTimeMS, 13500000)
+    array.push(arrTypeId, TYPE_Flash_Manufacturing_PMI)
+
+    array.push(arrDateStr, "2025-08-21")
+    array.push(arrTimeMS, 13500000)
+    array.push(arrTypeId, TYPE_Flash_Services_PMI)
+
+    array.push(arrDateStr, "2025-08-22")
+    array.push(arrTimeMS, 14400000)
+    array.push(arrTypeId, TYPE_Fed_Chair_Powell_Speaks)
+
+    array.push(arrDateStr, "2025-08-22")
+    array.push(arrTimeMS, 14400000)
+    array.push(arrTypeId, TYPE_Jackson_Hole_Symposium)
+
+    array.push(arrDateStr, "2025-08-28")
+    array.push(arrTimeMS, 9000000)
+    array.push(arrTypeId, TYPE_Prelim_GDP_q_q)
+
+    array.push(arrDateStr, "2025-08-28")
+    array.push(arrTimeMS, 9000000)
+    array.push(arrTypeId, TYPE_Unemployment_Claims)
+
+    array.push(arrDateStr, "2025-08-29")
+    array.push(arrTimeMS, 9000000)
+    array.push(arrTypeId, TYPE_Core_PCE_Price_Index_m_m)
+    // >>> CHANGE: END GENERATED NEWS EVENT ROWS — 2025-08
+
+    // >>> CHANGE: BEGIN GENERATED NEWS EVENT ROWS — 2025-09 (date, timeMS, typeId only)
+    array.push(arrDateStr, "2025-09-02")
+    array.push(arrTimeMS, 14400000)
+    array.push(arrTypeId, TYPE_ISM_Manufacturing_PMI)
+
+    array.push(arrDateStr, "2025-09-03")
+    array.push(arrTimeMS, 14400000)
+    array.push(arrTypeId, TYPE_JOLTS_Job_Openings)
+
+    array.push(arrDateStr, "2025-09-04")
+    array.push(arrTimeMS, 8100000)
+    array.push(arrTypeId, TYPE_ADP_Non_Farm_Employment_Change)
+
+    array.push(arrDateStr, "2025-09-04")
+    array.push(arrTimeMS, 9000000)
+    array.push(arrTypeId, TYPE_Unemployment_Claims)
+
+    array.push(arrDateStr, "2025-09-04")
+    array.push(arrTimeMS, 14400000)
+    array.push(arrTypeId, TYPE_ISM_Services_PMI)
+
+    array.push(arrDateStr, "2025-09-05")
+    array.push(arrTimeMS, 9000000)
+    array.push(arrTypeId, TYPE_Average_Hourly_Earnings_m_m)
+
+    array.push(arrDateStr, "2025-09-05")
+    array.push(arrTimeMS, 9000000)
+    array.push(arrTypeId, TYPE_Non_Farm_Employment_Change)
+
+    array.push(arrDateStr, "2025-09-05")
+    array.push(arrTimeMS, 9000000)
+    array.push(arrTypeId, TYPE_Unemployment_Rate)
+
+    array.push(arrDateStr, "2025-09-10")
+    array.push(arrTimeMS, 9000000)
+    array.push(arrTypeId, TYPE_Core_PPI_m_m)
+
+    array.push(arrDateStr, "2025-09-10")
+    array.push(arrTimeMS, 9000000)
+    array.push(arrTypeId, TYPE_PPI_m_m)
+
+    array.push(arrDateStr, "2025-09-11")
+    array.push(arrTimeMS, 9000000)
+    array.push(arrTypeId, TYPE_CPI_m_m)
+
+    array.push(arrDateStr, "2025-09-11")
+    array.push(arrTimeMS, 9000000)
+    array.push(arrTypeId, TYPE_CPI_y_y)
+
+    array.push(arrDateStr, "2025-09-11")
+    array.push(arrTimeMS, 9000000)
+    array.push(arrTypeId, TYPE_Core_CPI_m_m)
+
+    array.push(arrDateStr, "2025-09-11")
+    array.push(arrTimeMS, 9000000)
+    array.push(arrTypeId, TYPE_Unemployment_Claims)
+
+    array.push(arrDateStr, "2025-09-12")
+    array.push(arrTimeMS, 14400000)
+    array.push(arrTypeId, TYPE_Prelim_UoM_Consumer_Sentiment)
+
+    array.push(arrDateStr, "2025-09-12")
+    array.push(arrTimeMS, 14400000)
+    array.push(arrTypeId, TYPE_Prelim_UoM_Inflation_Expectations)
+
+    array.push(arrDateStr, "2025-09-16")
+    array.push(arrTimeMS, 9000000)
+    array.push(arrTypeId, TYPE_Core_Retail_Sales_m_m)
+
+    array.push(arrDateStr, "2025-09-16")
+    array.push(arrTimeMS, 9000000)
+    array.push(arrTypeId, TYPE_Retail_Sales_m_m)
+
+    array.push(arrDateStr, "2025-09-17")
+    array.push(arrTimeMS, 28800000)
+    array.push(arrTypeId, TYPE_FOMC_Economic_Projections)
+
+    array.push(arrDateStr, "2025-09-17")
+    array.push(arrTimeMS, 28800000)
+    array.push(arrTypeId, TYPE_FOMC_Statement)
+
+    array.push(arrDateStr, "2025-09-17")
+    array.push(arrTimeMS, 28800000)
+    array.push(arrTypeId, TYPE_Federal_Funds_Rate)
+
+    array.push(arrDateStr, "2025-09-17")
+    array.push(arrTimeMS, 30600000)
+    array.push(arrTypeId, TYPE_FOMC_Press_Conference)
+
+    array.push(arrDateStr, "2025-09-18")
+    array.push(arrTimeMS, 9000000)
+    array.push(arrTypeId, TYPE_Unemployment_Claims)
+
+    array.push(arrDateStr, "2025-09-23")
+    array.push(arrTimeMS, 13500000)
+    array.push(arrTypeId, TYPE_Flash_Manufacturing_PMI)
+
+    array.push(arrDateStr, "2025-09-23")
+    array.push(arrTimeMS, 13500000)
+    array.push(arrTypeId, TYPE_Flash_Services_PMI)
+
+    array.push(arrDateStr, "2025-09-25")
+    array.push(arrTimeMS, 9000000)
+    array.push(arrTypeId, TYPE_Final_GDP_q_q)
+
+    array.push(arrDateStr, "2025-09-23")
+    array.push(arrTimeMS, 25200000)
+    array.push(arrTypeId, TYPE_Fed_Chair_Powell_Speaks)
+
+    array.push(arrDateStr, "2025-09-25")
+    array.push(arrTimeMS, 9000000)
+    array.push(arrTypeId, TYPE_Unemployment_Claims)
+    // >>> CHANGE: END GENERATED NEWS EVENT ROWS — 2025-09
+
+    // >>> CHANGE: BEGIN GENERATED NEWS EVENT ROWS — 2025-10 (date, timeMS, typeId only)
+    array.push(arrDateStr, "2025-10-01")
+    array.push(arrTimeMS, 8100000)
+    array.push(arrTypeId, TYPE_ADP_Non_Farm_Employment_Change)
+
+    array.push(arrDateStr, "2025-10-01")
+    array.push(arrTimeMS, 14400000)
+    array.push(arrTypeId, TYPE_ISM_Manufacturing_PMI)
+
+    array.push(arrDateStr, "2025-10-02")
+    array.push(arrTimeMS, 9000000)
+    array.push(arrTypeId, TYPE_Unemployment_Claims)
+
+    array.push(arrDateStr, "2025-10-03")
+    array.push(arrTimeMS, 9000000)
+    array.push(arrTypeId, TYPE_Average_Hourly_Earnings_m_m)
+
+    array.push(arrDateStr, "2025-10-03")
+    array.push(arrTimeMS, 9000000)
+    array.push(arrTypeId, TYPE_Non_Farm_Employment_Change)
+
+    array.push(arrDateStr, "2025-10-03")
+    array.push(arrTimeMS, 9000000)
+    array.push(arrTypeId, TYPE_Unemployment_Rate)
+
+    array.push(arrDateStr, "2025-10-03")
+    array.push(arrTimeMS, 14400000)
+    array.push(arrTypeId, TYPE_ISM_Services_PMI)
+
+    array.push(arrDateStr, "2025-10-08")
+    array.push(arrTimeMS, 28800000)
+    array.push(arrTypeId, TYPE_FOMC_Meeting_Minutes)
+
+    array.push(arrDateStr, "2025-10-09")
+    array.push(arrTimeMS, 9000000)
+    array.push(arrTypeId, TYPE_Unemployment_Claims)
+
+    array.push(arrDateStr, "2025-10-10")
+    array.push(arrTimeMS, 14400000)
+    array.push(arrTypeId, TYPE_Prelim_UoM_Consumer_Sentiment)
+
+    array.push(arrDateStr, "2025-10-10")
+    array.push(arrTimeMS, 14400000)
+    array.push(arrTypeId, TYPE_Prelim_UoM_Inflation_Expectations)
+
+    array.push(arrDateStr, "2025-10-15")
+    array.push(arrTimeMS, 9000000)
+    array.push(arrTypeId, TYPE_CPI_m_m)
+
+    array.push(arrDateStr, "2025-10-15")
+    array.push(arrTimeMS, 9000000)
+    array.push(arrTypeId, TYPE_CPI_y_y)
+
+    array.push(arrDateStr, "2025-10-15")
+    array.push(arrTimeMS, 9000000)
+    array.push(arrTypeId, TYPE_Core_CPI_m_m)
+
+    array.push(arrDateStr, "2025-10-16")
+    array.push(arrTimeMS, 9000000)
+    array.push(arrTypeId, TYPE_Core_PPI_m_m)
+
+    array.push(arrDateStr, "2025-10-16")
+    array.push(arrTimeMS, 9000000)
+    array.push(arrTypeId, TYPE_Core_Retail_Sales_m_m)
+
+    array.push(arrDateStr, "2025-10-16")
+    array.push(arrTimeMS, 9000000)
+    array.push(arrTypeId, TYPE_PPI_m_m)
+
+    array.push(arrDateStr, "2025-10-16")
+    array.push(arrTimeMS, 9000000)
+    array.push(arrTypeId, TYPE_Retail_Sales_m_m)
+
+    array.push(arrDateStr, "2025-10-16")
+    array.push(arrTimeMS, 9000000)
+    array.push(arrTypeId, TYPE_Unemployment_Claims)
+
+    array.push(arrDateStr, "2025-10-23")
+    array.push(arrTimeMS, 9000000)
+    array.push(arrTypeId, TYPE_Unemployment_Claims)
+
+    array.push(arrDateStr, "2025-10-24")
+    array.push(arrTimeMS, 13500000)
+    array.push(arrTypeId, TYPE_Flash_Manufacturing_PMI)
+
+    array.push(arrDateStr, "2025-10-24")
+    array.push(arrTimeMS, 13500000)
+    array.push(arrTypeId, TYPE_Flash_Services_PMI)
+
+    array.push(arrDateStr, "2025-10-29")
+    array.push(arrTimeMS, 28800000)
+    array.push(arrTypeId, TYPE_FOMC_Statement)
+
+    array.push(arrDateStr, "2025-10-29")
+    array.push(arrTimeMS, 28800000)
+    array.push(arrTypeId, TYPE_Federal_Funds_Rate)
+
+    array.push(arrDateStr, "2025-10-29")
+    array.push(arrTimeMS, 30600000)
+    array.push(arrTypeId, TYPE_FOMC_Press_Conference)
+
+    array.push(arrDateStr, "2025-10-30")
+    array.push(arrTimeMS, 9000000)
+    array.push(arrTypeId, TYPE_Advance_GDP_q_q)
+
+    array.push(arrDateStr, "2025-10-30")
+    array.push(arrTimeMS, 9000000)
+    array.push(arrTypeId, TYPE_Unemployment_Claims)
+
+    array.push(arrDateStr, "2025-10-31")
+    array.push(arrTimeMS, 9000000)
+    array.push(arrTypeId, TYPE_Core_PCE_Price_Index_m_m)
+
+    array.push(arrDateStr, "2025-10-31")
+    array.push(arrTimeMS, 9000000)
+    array.push(arrTypeId, TYPE_Employment_Cost_Index_q_q)
+    // >>> CHANGE: END GENERATED NEWS EVENT ROWS — 2025-10
+    // >>> CHANGE: BEGIN GENERATED NEWS EVENT ROWS — 2025-11 (date, timeMS, typeId only)
+    array.push(arrDateStr, "2025-11-05")
+    array.push(arrTimeMS, 8100000)
+    array.push(arrTypeId, TYPE_ADP_Non_Farm_Employment_Change)
+
+    array.push(arrDateStr, "2025-11-06")
+    array.push(arrTimeMS, 9000000)
+    array.push(arrTypeId, TYPE_Unemployment_Claims)
+
+    array.push(arrDateStr, "2025-11-07")
+    array.push(arrTimeMS, 5400000)
+    array.push(arrTypeId, TYPE_Average_Hourly_Earnings_m_m)
+
+    array.push(arrDateStr, "2025-11-07")
+    array.push(arrTimeMS, 14400000)
+    array.push(arrTypeId, TYPE_Non_Farm_Employment_Change)
+
+    array.push(arrDateStr, "2025-11-07")
+    array.push(arrTimeMS, 14400000)
+    array.push(arrTypeId, TYPE_Unemployment_Rate)
+
+    array.push(arrDateStr, "2025-11-12")
+    array.push(arrTimeMS, 14400000)
+    array.push(arrTypeId, TYPE_CPI_m_m)
+
+    array.push(arrDateStr, "2025-11-12")
+    array.push(arrTimeMS, 14400000)
+    array.push(arrTypeId, TYPE_CPI_y_y)
+
+    array.push(arrDateStr, "2025-11-12")
+    array.push(arrTimeMS, 14400000)
+    array.push(arrTypeId, TYPE_Core_CPI_m_m)
+
+    array.push(arrDateStr, "2025-11-13")
+    array.push(arrTimeMS, 11040000)
+    array.push(arrTypeId, TYPE_PPI_m_m)
+
+    array.push(arrDateStr, "2025-11-13")
+    array.push(arrTimeMS, 11040000)
+    array.push(arrTypeId, TYPE_Core_PPI_m_m)
+
+    array.push(arrDateStr, "2025-11-14")
+    array.push(arrTimeMS, 11040000)
+    array.push(arrTypeId, TYPE_Retail_Sales_m_m)
+
+    array.push(arrDateStr, "2025-11-14")
+    array.push(arrTimeMS, 11040000)
+    array.push(arrTypeId, TYPE_Core_Retail_Sales_m_m)
+
+    array.push(arrDateStr, "2025-11-19")
+    array.push(arrTimeMS, 28800000)
+    array.push(arrTypeId, TYPE_FOMC_Statement)
+
+    array.push(arrDateStr, "2025-11-19")
+    array.push(arrTimeMS, 28800000)
+    array.push(arrTypeId, TYPE_Federal_Funds_Rate)
+
+    array.push(arrDateStr, "2025-11-19")
+    array.push(arrTimeMS, 30600000)
+    array.push(arrTypeId, TYPE_FOMC_Press_Conference)
+
+    array.push(arrDateStr, "2025-11-26")
+    array.push(arrTimeMS, 11040000)
+    array.push(arrTypeId, TYPE_Prelim_GDP_q_q)
+
+    array.push(arrDateStr, "2025-11-26")
+    array.push(arrTimeMS, 11040000)
+    array.push(arrTypeId, TYPE_Prelim_UoM_Consumer_Sentiment)
+
+    array.push(arrDateStr, "2025-11-26")
+    array.push(arrTimeMS, 11040000)
+    array.push(arrTypeId, TYPE_Prelim_UoM_Inflation_Expectations)
+
+    array.push(arrDateStr, "2025-11-27")
+    array.push(arrTimeMS, 9000000)
+    array.push(arrTypeId, TYPE_Unemployment_Claims)
+    // >>> CHANGE: END GENERATED NEWS EVENT ROWS — 2025-11
+
+    // >>> CHANGE: BEGIN GENERATED NEWS EVENT ROWS — 2025-12 (date, timeMS, typeId only)
+    array.push(arrDateStr, "2025-12-04")
+    array.push(arrTimeMS, 9000000)
+    array.push(arrTypeId, TYPE_Unemployment_Claims)
+
+    array.push(arrDateStr, "2025-12-04")
+    array.push(arrTimeMS, 14400000)
+    array.push(arrTypeId, TYPE_ISM_Manufacturing_PMI)
+
+    array.push(arrDateStr, "2025-12-04")
+    array.push(arrTimeMS, 14400000)
+    array.push(arrTypeId, TYPE_JOLTS_Job_Openings)
+
+    array.push(arrDateStr, "2025-12-06")
+    array.push(arrTimeMS, 5400000)
+    array.push(arrTypeId, TYPE_Average_Hourly_Earnings_m_m)
+
+    array.push(arrDateStr, "2025-12-06")
+    array.push(arrTimeMS, 14400000)
+    array.push(arrTypeId, TYPE_Non_Farm_Employment_Change)
+
+    array.push(arrDateStr, "2025-12-06")
+    array.push(arrTimeMS, 14400000)
+    array.push(arrTypeId, TYPE_Unemployment_Rate)
+
+    array.push(arrDateStr, "2025-12-10")
+    array.push(arrTimeMS, 14400000)
+    array.push(arrTypeId, TYPE_CPI_m_m)
+
+    array.push(arrDateStr, "2025-12-10")
+    array.push(arrTimeMS, 14400000)
+    array.push(arrTypeId, TYPE_CPI_y_y)
+
+    array.push(arrDateStr, "2025-12-10")
+    array.push(arrTimeMS, 14400000)
+    array.push(arrTypeId, TYPE_Core_CPI_m_m)
+
+    array.push(arrDateStr, "2025-12-11")
+    array.push(arrTimeMS, 11040000)
+    array.push(arrTypeId, TYPE_PPI_m_m)
+
+    array.push(arrDateStr, "2025-12-11")
+    array.push(arrTimeMS, 11040000)
+    array.push(arrTypeId, TYPE_Core_PPI_m_m)
+
+    array.push(arrDateStr, "2025-12-12")
+    array.push(arrTimeMS, 11040000)
+    array.push(arrTypeId, TYPE_Retail_Sales_m_m)
+
+    array.push(arrDateStr, "2025-12-12")
+    array.push(arrTimeMS, 11040000)
+    array.push(arrTypeId, TYPE_Core_Retail_Sales_m_m)
+
+    array.push(arrDateStr, "2025-12-17")
+    array.push(arrTimeMS, 28800000)
+    array.push(arrTypeId, TYPE_FOMC_Statement)
+
+    array.push(arrDateStr, "2025-12-17")
+    array.push(arrTimeMS, 28800000)
+    array.push(arrTypeId, TYPE_Federal_Funds_Rate)
+
+    array.push(arrDateStr, "2025-12-17")
+    array.push(arrTimeMS, 30600000)
+    array.push(arrTypeId, TYPE_FOMC_Press_Conference)
+
+    array.push(arrDateStr, "2025-12-31")
+    array.push(arrTimeMS, 11040000)
+    array.push(arrTypeId, TYPE_Prelim_GDP_q_q)
+
+    array.push(arrDateStr, "2025-12-31")
+    array.push(arrTimeMS, 11040000)
+    array.push(arrTypeId, TYPE_Prelim_UoM_Consumer_Sentiment)
+
+    array.push(arrDateStr, "2025-12-31")
+    array.push(arrTimeMS, 11040000)
+    array.push(arrTypeId, TYPE_Prelim_UoM_Inflation_Expectations)
+    // >>> CHANGE: END GENERATED NEWS EVENT ROWS — 2025-12
+
+
+// ——— Evaluate today's news to set sev3Blocked (no labels here) ———
+bool _newsBlocked = false
+int _N = array.size(arrDateStr)
+for _i = 0 to _N - 1
+    string _d = array.get(arrDateStr, _i)
+    bool _isToday = _d == sessionDateStr
+    if _isToday
+        int _tid = array.get(arrTypeId, _i)                // define _tid
+        int _sev = array.get(typeSevByTypeId, _tid)        // use per-type severity (exact casing)
+        bool _allow = array.get(allowByTypeId, _tid)
+        bool _sevEnabled = (_sev == 3 and useSev3Filter) or (_sev == 2 and useSev2Filter) or (_sev == 1 and useSev1Filter)
+        bool _blocks = _sevEnabled and not _allow
+        if _blocks
+            _newsBlocked := true
+sev3Blocked = _newsBlocked
+
+
+// ─── Session / Mode ─────────────────────────────────────────────
+bool forceHistoricalOnly = input.bool(false, "Force Historical Only (override realtime)", group="Session/Mode")
+bool realtimeEffective   = barstate.isrealtime and not forceHistoricalOnly
+
+// ───────────────────────────────────────────────────────────────
+// 5) FRESHNESS WATCHERS (rebuild window on TZ / input change)
+// ───────────────────────────────────────────────────────────────
+
+// NEW: detect user TZ changes (string-safe) and trigger a window rebuild
+var string _tzPrev = na
+if na(_tzPrev)
+    _tzPrev := tzInput
+if tzInput != _tzPrev
+    resetTimes := true
+    _tzPrev := tzInput
+
+// Rebuild window if key config flips mid-session (string/int/hash-safe)
+var string _cfgUID = ""
+string _cfgNow = str.format("{0}", tzInput)
+if _cfgNow != _cfgUID
+    resetTimes := true
+    _cfgUID := _cfgNow
+
+// ───────────────────────────────────────────────────────────────
+// 6) Internal State  LEVELS, TP & STOPS
+// ───────────────────────────────────────────────────────────────
+// --- SNAPSHOTS (frozen at first breakout bar) ---
+var bool   sessionSnapTaken = false
+var bool   sessionValidFrozen = true
+var string sessionInvalidReasonFrozen = ""
+
+// declare each var separately
+var float dayHigh = na
+var float dayLow  = na
+var bool placedTrades = false
+// [NEW] Deferred re-arm flags after a profit when immediate midpoint-gated reissue fails
+var bool rearmAfterProfitPending = false
+var int  rearmEligibleFromBar    = na
+
+longEntry   = dayHigh + entryOff
+shortEntry  = dayLow  - entryOff
+longStop    = dayLow  - stopOff
+shortStop   = dayHigh + stopOff
+rangeSize   = math.abs(longEntry - longStop)
+tpSize       = rangeSize * tpRatio
+longTP      = longEntry  + tpSize
+shortTP     = shortEntry - tpSize
+stopSize = switch slType
+    "RR"     => tpSize * rrRatio
+    "Points" => ptsSL
+    => na
+
+
+// ► Opposite-side TP override flag
+bool oppTPOverrideActive = oppositeTpOverride >= 0
+
+// ── SIZING SNAPSHOT (frozen at first breakout) ──
+var bool  sizingSnapTaken = false
+var float sLongEntry  = na
+var float sShortEntry = na
+var float sLongStop   = na
+var float sShortStop  = na
+var float sLongTP     = na
+var float sShortTP    = na
+
+bool doSizeSnap = not sizingSnapTaken and time[1] < rangeEnd and time >= rangeEnd and not na(dayHigh) and not na(dayLow) and dayHigh != dayLow
+if doSizeSnap
+    sLongEntry := longEntry
+    sShortEntry := shortEntry
+    sLongStop := longStop
+    sShortStop := shortStop
+    sLongTP := longTP
+    sShortTP := shortTP
+    sizingSnapTaken := true
+
+float useLongEntry  = sizingSnapTaken ? sLongEntry  : longEntry
+float useShortEntry = sizingSnapTaken ? sShortEntry : shortEntry
+float useLongStop   = sizingSnapTaken ? sLongStop   : longStop
+float useShortStop  = sizingSnapTaken ? sShortStop  : shortStop
+float useLongTP     = sizingSnapTaken ? sLongTP     : longTP
+float useShortTP    = sizingSnapTaken ? sShortTP    : shortTP
+
+// ── FROZEN Opposite-TP targets (session-stable) ──
+float useOppMult    = oppTPOverrideActive ? oppositeTpOverride : tpRatio
+float useRangeSize  = math.abs(useLongEntry - useLongStop)
+float useTpSizeOpp  = useRangeSize * useOppMult
+float useLongTPOpp  = useLongEntry + useTpSizeOpp
+float useShortTPOpp = useShortEntry - useTpSizeOpp
+
+// superseded by frozen useLongTPOpp/useShortTPOpp
+rangeSize := rangeSize
+
+// Working vars for scaled reissue (declare once; update with :=)
+var bool   oppTPLineActive = false
+var bool   oppTPLineIsLong = false
+var float  oppTPLinePrice  = na
+
+// ───────────────────────────────────────────────────────────────
+// 7) ORDER HELPERS
+// ───────────────────────────────────────────────────────────────
+
+// "+/-HHMM" offset string for given tz at current bar date
+f_tz_offset_str(_tz) =>
+    int yy = year(time, _tz), mm = month(time, _tz), dd = dayofmonth(time, _tz)
+    int locMid = timestamp(_tz, yy, mm, dd, 0, 0), utcMid = timestamp("UTC", yy, mm, dd, 0, 0)
+    int offMin = int(math.round((locMid - utcMid) / 60000))
+    int ah = math.abs(offMin) / 60, am = math.abs(offMin) % 60
+    string sgn = offMin >= 0 ? "+" : "-"
+    sgn + str.tostring(ah, "00") + str.tostring(am, "00")
+
+// "YYYY-MM-DDTHH:MM:SS±HHMM" using tzInput
+f_iso_local(_t, _tz) =>
+    string d = str.tostring(year(_t, _tz)) + "-" + str.tostring(month(_t, _tz), "00") + "-" + str.tostring(dayofmonth(_t, _tz), "00")
+    string h = str.tostring(hour(_t, _tz), "00") + ":" + str.tostring(minute(_t, _tz), "00") + ":" + str.tostring(second(_t, _tz), "00")
+    d + "T" + h + f_tz_offset_str(_tz)
+
+// Atomic exit: cancel → close → emit (chart JSON + optional proxy JSON via new TradersPost API)
+// Returns [didExit, proxySent]
+f_exit_atomic(_reason, _comment, _price, _timeMS, _tz, _chartTkr, _proxyTkr, _emitLabel, _doCancelAllBefore, _thisEntryId, _thisExitId, _oppPrimaryId, _oppPrimaryExitId, _allowChartEmit, _allowProxyEmit) =>
+    bool didExit = false
+    bool proxySent = false
+    bool inPosBefore = strategy.position_size != 0
+
+    if _doCancelAllBefore
+        strategy.cancel_all()
+    else
+        if str.length(_thisEntryId) > 0
+            strategy.cancel(_thisEntryId)
+        if str.length(_thisExitId) > 0
+            strategy.cancel(_thisExitId)
+        if str.length(_oppPrimaryId) > 0
+            strategy.cancel(_oppPrimaryId)
+        if str.length(_oppPrimaryExitId) > 0
+            strategy.cancel(_oppPrimaryExitId)
+
+    if inPosBefore
+        strategy.close_all(comment = _comment)
+        didExit := true
+
+    if str.length(_chartTkr) > 0 and _allowChartEmit
+        //_resp_c = tp.SendAdvancedOrder(ticker = _chartTkr, action = tp.Action.exit, signalPrice = _price, disableCancel = false)
+        //_log_c  = tp._validateAndBuildJSON(ticker = _chartTkr, action = tp.Action.exit, signalPrice = _price, disableCancel = false)
+        //log.info("JSON Output:\n" + _log_c.message)
+        _exit = tp.SendAdvancedOrder(ticker = _chartTkr, orderType = tp.OrderType.market, action = tp.Action.exit, signalPrice = _price, cancel = true)
+        log.info("JSON Normal Output:\n" + _exit.message)
+
+    if useProxyRealtimeOnly and realtimeEffective and str.length(_proxyTkr) > 0 and _proxyTkr != _chartTkr and _allowProxyEmit
+        _exit_proxy = tp.SendAdvancedOrder(ticker = _proxyTkr, orderType = tp.OrderType.market, action = tp.Action.exit, signalPrice = _price, cancel = true)
+        log.info("JSON Proxy Output:\n" + _exit_proxy.message)
+        proxySent := true
+
+    if _emitLabel and showDebugLabels and didExit
+        label.new(bar_index, low - syminfo.mintick * 40, "Exit • " + _comment, style = label.style_label_down, color = color.new(color.green, 20), textcolor = color.white)
+
+    [didExit, proxySent]
+
+
+
+// Position Size Calculation
+f_calcPositionSize(_entry, _stop) =>
+    float priceDiff = math.abs(_entry - _stop)
+    float tickCount = syminfo.mintick != 0 ? priceDiff / syminfo.mintick : priceDiff
+    costPerContract = tickCount * syminfo.pointvalue
+    bool isMicro = str.substring(syminfo.ticker, 0, 1) == "M"
+    //made this change to be able to round up for YM, violates risk rules, but on a high probability trade.
+    contractCount = isMicro ? math.floor(riskDollars / costPerContract) : math.round(riskDollars / costPerContract)
+    if minimumOneContract and contractCount <= 0
+        contractCount := 1
+    contractCount
+
+
+// Projected-risk helpers (qty × |entry-stop| in ticks × pointvalue), think about the risk we are about to take
+// and abort if we are going to blow our daily lose limit. 
+f_calcTradeRiskDollars(_entry, _stop, _qty) =>
+    float priceDiff = math.abs(_entry - _stop), float ticks = syminfo.mintick != 0 ? priceDiff / syminfo.mintick : priceDiff, float riskPer = ticks * syminfo.pointvalue, float tot = riskPer * _qty, tot
+
+f_projectedRiskOK(_entry, _stop, _qty, _curLossDollars) =>
+    float addLoss = f_calcTradeRiskDollars(_entry, _stop, _qty), bool limitOff = maxDailyLoss <= 0, bool ok = limitOff or (_curLossDollars + addLoss <= maxDailyLoss), ok
+
+// Centralized issuer for bracket alerts + local strategy orders (single source of truth)
+f_issueBracket(id, dir, entry, stop, limit, qty, placeLocal, tkr) =>
+    bool isLong = dir == strategy.long
+    bool useStopEntry = not na(entry)
+    tp_orderType = useStopEntry ? tp.OrderType.stop : tp.OrderType.market
+    // --- NEW: Send TradersPost bracket (absolute TP/SL prices) ---
+    _resp_b = tp.SendBracketOrder(ticker = tkr, action = (isLong ? tp.Action.buy : tp.Action.sell), quantity = qty, quantityType = tp.QuantityType.fixed, orderType = tp_orderType, entryPrice = (useStopEntry ? entry : na), takeProfitPrice = (not na(limit) ? limit : na), stopLossPrice = (not na(stop) ? stop : na), takeProfitAmount = na, stopLossAmount = na, stopLossType = tp.StopLossType.stop, signalPrice = close, comment = id)
+    // --- NEW: JSON echo for observability (same style as exits) ---
+    if qty > 0
+        log.info("Entry Bracket JSON:\n" + _resp_b.message)
+    if placeLocal and qty > 0
+        strategy.entry(id, dir, stop = entry, qty = qty)
+        strategy.exit(id + "_Exit", from_entry = id, stop = stop, limit = limit)
+    placeLocal and qty > 0
+
+f_placeBracket(id, dir, entry, stop, limit, tradesCount, alreadyIssued, rangeConfirmed, _curLossDollars) =>
+    qty = f_calcPositionSize(entry, stop)
+    bool orderPlaced = false
+    bool issuedNow   = false
+    bool allowByRisk = f_projectedRiskOK(entry, stop, qty, _curLossDollars)
+    if qty > 0 and rangeConfirmed and allowByRisk
+        if not alreadyIssued
+            string labelText = "#" + str.tostring(tradesCount + 1) + " Orders Issued"
+            if showDebugLabels
+                label.new(x=bar_index, y=dayHigh + syminfo.mintick * 100, text=labelText, style=label.style_label_down, color=color.orange, textcolor=color.white)
+            bool _placed = f_issueBracket(id, dir, entry, stop, limit, qty, true, syminfo.ticker)
+            orderPlaced := _placed
+        else
+            orderPlaced := orderPlaced
+    orderPlaced
+
+
+// Centralized entry/exit with explicit qty (for proxy adds & special cases)
+f_placeBracket_qty(id, dir, entry, stop, limit, qty) =>
+    f_issueBracket(id, dir, entry, stop, limit, qty, true, syminfo.ticker)
+
+
+isPriceInsideRange() =>
+    close < useLongEntry and close > useShortEntry
+
+// Build full-size contract from micro root (MES→ES, MNQ→NQ, MYM→YM); else return original
+f_get_proxy_ticker(_base) =>
+    string r3 = str.substring(_base, 0, 3)
+    string out = (r3 == "MES" or r3 == "MNQ" or r3 == "MYM") ? str.substring(_base, 1, str.length(_base)) : _base
+    out
+
+// Send opposite entry on proxy symbol (full-size) with proper TP/SL objects
+// NOTE: _qtyMicro is the intended MICRO-equivalent add; _qtyMul is the micro→full multiplier (e.g., 0.10)
+f_send_opposite_on_proxy(_proxyTicker, _isLongOpp, _entry, _stop, _tp, _qtyMicro, _qtyMul, _blocked) =>
+    int qFull = na
+    int qMicro = na
+    bool placed = false
+    if not _blocked
+        qFull := int(math.max(1, math.floor(_qtyMicro * _qtyMul)))
+        qMicro := int(math.max(1, math.floor(_qtyMicro)))
+        string sid = (_isLongOpp ? "OppAddL_" : "OppAddS_") + str.tostring(bar_index)
+        if useProxyRealtimeOnly and realtimeEffective
+
+            _ = f_issueBracket(sid, _isLongOpp ? strategy.long : strategy.short, _entry, _stop, _tp, qFull, false, _proxyTicker)
+            placed :=  qFull > 0
+        else
+            bool _p = f_issueBracket(sid, _isLongOpp ? strategy.long : strategy.short, _entry, _stop, _tp, qMicro, true, syminfo.ticker)
+            placed := _p
+    placed
+
+
+// ► Compute ADDITIONAL full-size contracts needed so that TOTAL $ risk ≈ (base_micro_risk × targetMult).
+// We leave the original micro bracket intact and only add the delta as a full-size order.
+// Returns integer # of full-size contracts (>= 0). Uses current symbol's pointvalue for risk math.
+f_calc_additional_proxy_qty(_entry, _stop, _targetMult, _ensureMin1) =>
+    // Risk per 1 MICRO contract:
+    float riskPerMicro = f_calcTradeRiskDollars(_entry, _stop, 1)
+    // Base MICRO qty (what bracket sizing would choose now)
+    float baseQtyMicro = f_calcPositionSize(_entry, _stop)
+    // Base risk in $ actually represented by MICRO side:
+    float baseRisk = riskPerMicro * baseQtyMicro
+    // Target total risk:
+    float targetRisk = baseRisk * _targetMult
+    // Additional risk needed for target (if any):
+    float addRisk = targetRisk - baseRisk
+    // $ risk per ONE FULL-SIZE contract ≈ riskPerMicro / proxyQtyMul (e.g., /0.10 = ×10)
+    float riskPerFull = proxyQtyMul > 0 ? riskPerMicro / proxyQtyMul : na
+    int qFull = addRisk > 0 and not na(riskPerFull) and riskPerFull > 0 ? int(math.floor(addRisk / riskPerFull)) : 0
+    // Optionally enforce at least 1 full-size contract when addRisk > 0
+    if _ensureMin1 and addRisk > 0 and qFull <= 0
+        qFull := 1
+    qFull
+
+// ► Compute ADDITIONAL MICRO contracts needed so TOTAL $ risk ≈ (base_micro_risk × targetMult).
+// Returns integer # of micro contracts (>= 0). Does not quantize through full-size.
+f_calc_additional_micro_qty(_entry, _stop, _targetMult, _ensureMin1) =>
+    float riskPerMicro = f_calcTradeRiskDollars(_entry, _stop, 1)
+    float baseQtyMicro = f_calcPositionSize(_entry, _stop)
+    float baseRisk = riskPerMicro * baseQtyMicro
+    float targetRisk = baseRisk * _targetMult
+    float addRisk = targetRisk - baseRisk
+    int qMicro = addRisk > 0 and riskPerMicro > 0 ? int(math.floor(addRisk / riskPerMicro)) : 0
+    if _ensureMin1 and addRisk > 0 and qMicro <= 0
+        qMicro := 1
+    qMicro
+
+// Tracks whether we issued a proxy (YM) add-on, so we can also exit it
+var bool   proxyPosActive = false
+var string proxyTickerPos = ""
+var int    proxyPosDir    = 0     // +1 long, -1 short
+var int    proxyPosQty    = 0     // full-size contracts requested
+
+
+
+// ───────────────────────────────────────────────────────────────
+// 8) DST-SAFE WINDOW BUILDER (single 3:10 session)
+// ───────────────────────────────────────────────────────────────
+// ──────────────────────────────────────────────
+// Midnight-proof range window (Pine v6 standalone)
+// Requirements in scope (types shown for clarity):
+//   string tzInput
+//   int    rangeEndHour, rangeEndMin
+//   int    lookbackH, lookbackM, exitDurH, exitDurM
+//   var int rangeStart = na, rangeEnd = na, exitTime = na
+//   var bool resetTimes = false
+// ──────────────────────────────────────────────
+if resetTimes
+    // If overrides not ready, keep previous window (prevents “epoch lines”)
+    if na(rangeEndHour) or na(rangeEndMin)
+        rangeEnd   := rangeEnd
+        rangeStart := rangeStart
+        exitTime   := exitTime
+    else
+        // Build today's end-of-range anchor in tzInput
+        int yy = year(time, tzInput)
+        int mm = month(time, tzInput)
+        int dd = dayofmonth(time, tzInput)
+        int nowH = hour(time, tzInput)
+        int nowM = minute(time, tzInput)
+
+        int baseEnd = timestamp(tzInput, yy, mm, dd, rangeEndHour, rangeEndMin)
+        bool pastCut = nowH > rangeEndHour or (nowH == rangeEndHour and nowM >= rangeEndMin)
+
+        // If we’re already past the cut today, roll anchor to the next calendar day (DST-safe)
+        if pastCut
+            int ny = year(baseEnd + 86400000, tzInput)
+            int nm = month(baseEnd + 86400000, tzInput)
+            int nd = dayofmonth(baseEnd + 86400000, tzInput)
+            baseEnd := timestamp(tzInput, ny, nm, nd, rangeEndHour, rangeEndMin)
+
+        int lookbackMS = lookbackH * 3600000 + lookbackM * 60000
+        int exitDurMS  = exitDurH * 3600000 + exitDurM * 60000
+
+        rangeEnd   := baseEnd
+        rangeStart := baseEnd - lookbackMS
+        exitTime   := baseEnd + exitDurMS
+
+        // Safety: ensure strictly increasing times even for 0h / 24h lookbacks
+        if rangeStart >= rangeEnd
+            rangeStart := rangeEnd - 60000
+
+        // Commit window + clear reset flag atomically
+        drew := false
+        resetTimes := false
+
+
+// ───────────────────────────────────────────────────────────────
+// 9) WINDOW FLAGS
+// ───────────────────────────────────────────────────────────────
+bool inDefine   = time >= rangeStart and time < rangeEnd
+bool inBreakoutWindow = time >= rangeEnd and time < exitTime
+// 9.1) Early-exit window flag (derived every bar)
+int earlyMS = earlyExitMinutes * 60000
+int earlyStart = exitTime - earlyMS
+bool inEarlyWindow = not na(exitTime) and not na(earlyStart) and time >= earlyStart and time < exitTime
+
+/// ───────────────────────────────────────────────────────────────
+// 10) INDICATORS (compute every bar; no stateful calls in branches)
+// ───────────────────────────────────────────────────────────────
+
+float vwapSource = inDefine or inBreakoutWindow ? hlc3 : na
+float sessionVWAP = ta.vwap(vwapSource)
+float sessionVWMA = ta.vwma(close, vwapLen)
+anchoredVWAP = vwapMode == "Session" ? (na(sessionVWAP) ? sessionVWMA : sessionVWAP) : sessionVWMA
+
+// ───────────────────────────────────────────────────────────────
+// 11) QUALITY FILTERS EVAL (freeze once at first breakout)
+// Spec: Freeze sessionValid + reason at first breakout
+// ───────────────────────────────────────────────────────────────
+bool firstBreakoutBar = time[1] < rangeEnd and time >= rangeEnd
+if firstBreakoutBar and not na(dayHigh) and not na(dayLow) and dayHigh != dayLow
+    float _width = dayHigh - dayLow
+    bool minOk = minRangePoints <= 0 or _width >= minRangePoints
+    bool maxOk = maxRangePoints <= 0 or _width <= maxRangePoints
+
+    // >>> CHANGE: single-pass news evaluation + detailed reasons (this replaces any earlier news loop)
+    string newsReasons = ""
+    int newsMaxSev = 0
+    int _Nn = array.size(arrDateStr)
+    for _i = 0 to _Nn - 1
+        string _d = array.get(arrDateStr, _i)
+        bool _isToday = _d == sessionDateStr
+        if _isToday
+            int _tid = array.get(arrTypeId, _i)
+            int _sev = array.get(typeSevByTypeId, _tid)  // use the map here too
+            bool _allow = array.get(allowByTypeId, _tid)
+            bool _sevEnabled = (_sev == 3 and useSev3Filter) or (_sev == 2 and useSev2Filter) or (_sev == 1 and useSev1Filter)
+            bool _blocks = _sevEnabled and not _allow
+            if _blocks
+                string _nm = switch _tid
+                    TYPE_CPI_m_m => "CPI m/m"
+                    TYPE_CPI_y_y => "CPI y/y"
+                    TYPE_Core_CPI_m_m => "Core CPI m/m"
+                    TYPE_Core_PPI_m_m => "Core PPI m/m"
+                    TYPE_FOMC_Economic_Projections => "FOMC Economic Projections"
+                    TYPE_FOMC_Meeting_Minutes => "FOMC Meeting Minutes"
+                    TYPE_Federal_Funds_Rate => "Federal Funds Rate"
+                    TYPE_ISM_Manufacturing_PMI => "ISM Manufacturing PMI"
+                    TYPE_ISM_Services_PMI => "ISM Services PMI"
+                    TYPE_Non_Farm_Employment_Change => "Non-Farm Employment Change"
+                    TYPE_PPI_m_m => "PPI m/m"
+                    TYPE_President_Trump_Speaks => "President Trump Speaks"
+                    TYPE_Unemployment_Rate => "Unemployment Rate"
+                    TYPE_Core_PCE_Price_Index_m_m => "Core PCE Price Index m/m"
+                    TYPE_Core_Retail_Sales_m_m => "Core Retail Sales m/m"
+                    TYPE_FOMC_Press_Conference => "FOMC Press Conference"
+                    TYPE_FOMC_Statement => "FOMC Statement"
+                    TYPE_Fed_Chair_Powell_Speaks => "Fed Chair Powell Speaks"
+                    TYPE_Fed_Chair_Powell_Testifies => "Fed Chair Powell Testifies"
+                    TYPE_Retail_Sales_m_m => "Retail Sales m/m"
+                    TYPE_ADP_Non_Farm_Employment_Change => "ADP Non-Farm Employment Change"
+                    TYPE_Advance_GDP_q_q => "Advance GDP q/q"
+                    TYPE_Average_Hourly_Earnings_m_m => "Average Hourly Earnings m/m"
+                    TYPE_Employment_Cost_Index_q_q => "Employment Cost Index q/q"
+                    TYPE_Final_GDP_q_q => "Final GDP q/q"
+                    TYPE_Flash_Manufacturing_PMI => "Flash Manufacturing PMI"
+                    TYPE_Flash_Services_PMI => "Flash Services PMI"
+                    TYPE_JOLTS_Job_Openings => "JOLTS Job Openings"
+                    TYPE_Jackson_Hole_Symposium => "Jackson Hole Symposium"
+                    TYPE_Prelim_GDP_q_q => "Prelim GDP q/q"
+                    TYPE_Prelim_UoM_Consumer_Sentiment => "Prelim UoM Consumer Sentiment"
+                    TYPE_Prelim_UoM_Inflation_Expectations => "Prelim UoM Inflation Expectations"
+                    TYPE_Unemployment_Claims => "Unemployment Claims"
+                    => "News"
+                bool _dupe = str.contains("|" + newsReasons + "|", "|" + _nm + "|")
+                newsReasons := _dupe ? newsReasons : (newsReasons == "" ? _nm : newsReasons + ", " + _nm)
+                newsMaxSev := _sev > newsMaxSev ? _sev : newsMaxSev
+
+    bool sevOk = newsReasons == ""
+
+    // >>> CHANGE: single source of truth for the rest of the script
+    //sev3Blocked := not sevOk
+
+    // Build frozen reason string (snapshot checks only)
+    sessionInvalidReasonFrozen := ""
+    if not minOk
+        sessionInvalidReasonFrozen += (sessionInvalidReasonFrozen != "" ? " | " : "") + "Min Range Size"
+    if not maxOk
+        sessionInvalidReasonFrozen += (sessionInvalidReasonFrozen != "" ? " | " : "") + "Max Range Size"
+    if not sevOk
+        string _newsTag = "News: " + newsReasons + " (Sev " + str.tostring(newsMaxSev) + ")"
+        sessionInvalidReasonFrozen += (sessionInvalidReasonFrozen != "" ? " | " : "") + _newsTag  // >>> CHANGE: detailed reason
+
+    sessionValidFrozen := sessionInvalidReasonFrozen == ""
+    sessionSnapTaken := true
+    sessionValid := sessionValidFrozen
+    sessionInvalidReason := sessionInvalidReasonFrozen
+
+    if showDebugLabels and not sessionValidFrozen
+        label.new(bar_index, low, "Skipped: " + sessionInvalidReasonFrozen, style=label.style_label_up, textcolor=color.black, color=color.yellow, xloc=xloc.bar_index, yloc=yloc.belowbar)
+
+// Keep live mirrors after snapshot
+if sessionSnapTaken
+    sessionValid := sessionValidFrozen
+    sessionInvalidReason := sessionInvalidReasonFrozen
+// ───────────────────────────────────────────────────────────────
+// END 11) QUALITY FILTERS EVAL (freeze once at first breakout)
+// ───────────────────────────────────────────────────────────────
+
+
+// ───────────────────────────────────────────────────────────────
+// 12) OPTIONAL DEFERRED START (midpoint proximity) 
+// ───────────────────────────────────────────────────────────────
+scoped_rangeMidpoint = not na(dayHigh) and not na(dayLow) ? (dayHigh + dayLow) / 2 : na
+scoped_rangeWidth = not na(dayHigh) and not na(dayLow) ? (dayHigh - dayLow) : na
+scoped_inBreakoutWindow = not na(exitTime) and time >= rangeEnd and time < exitTime and time > rangeStart
+scoped_inDeferredBreakout = scoped_inBreakoutWindow and not scoped_officialRangeStarted
+scoped_isNearMidpoint = not na(scoped_rangeMidpoint) and scoped_rangeWidth > 0 and math.abs(close - scoped_rangeMidpoint) <= (scoped_rangeWidth * midpointStartTolerancePct / 100)
+ 
+// TEMP DEBUG: trace post-range bars until official start flips
+var int _traceCount = 0
+bool _isBreakoutBar = time[1] < rangeEnd and time >= rangeEnd
+bool _shouldTrace = scoped_inBreakoutWindow and not scoped_officialRangeStarted and _traceCount < 8
+if not sessionBlocked
+
+    // === LEGITIMATE TRIGGERS
+    //isValidMidpointTrigger = scoped_inBreakoutWindow and midpointStartTolerancePct > 0 and scoped_isNearMidpoint
+    isValidMidpointTrigger   = scoped_inBreakoutWindow 
+                         and midpointStartTolerancePct > 0 
+                         and scoped_isNearMidpoint 
+                         and barstate.isconfirmed //after so many issue, I finally make it require a bar close, flipping values mid bar etc
+    isValidFallbackTrigger = scoped_inBreakoutWindow and midpointStartTolerancePct <= 0
+
+
+    // ✅ Proximity activation
+    if isValidMidpointTrigger and not scoped_officialRangeStarted
+        scoped_officialRangeStarted := true
+        scoped_actualRangeStart := time
+        //label.new(bar_index, high+40, "Midpoint", style=label.style_label_down, color=color.purple, textcolor=color.white)
+
+    // ✅ Fallback activation
+    if isValidFallbackTrigger and not scoped_officialRangeStarted
+        scoped_officialRangeStarted := true
+        scoped_actualRangeStart := time
+   
+   //// 🔒 LOCKDOWN GUARD — prevent external or leaked triggers
+   // if not (isValidMidpointTrigger or isValidFallbackTrigger)
+   //     scoped_officialRangeStarted := false
+
+    var label deferredStartLabel = na
+    if showDebugLabels and scoped_inBreakoutWindow and not scoped_officialRangeStarted and time == rangeEnd and not na(dayHigh)
+        deferredStartLabel := label.new(x=bar_index, y=dayHigh + syminfo.mintick * 40, text="Deferred Start", style=label.style_label_down, color=color.new(color.red, 85), textcolor=color.white)
+
+// ─────────────────────────────
+// 12.b) Midpoint Start — Why Not? (diagnostics)
+// ─────────────────────────────
+// Inputs used: showLowLevelTrace (already defined)
+// Vars used: scoped_inBreakoutWindow, midpointStartTolerancePct, scoped_isNearMidpoint,
+//            scoped_officialRangeStarted, sessionValidFrozen, sessionValid, sessionBlocked,
+//            tradingHalted, requireMidpointReturn, tradesToday, inEarlyWindow
+// No redeclarations; pure observability.
+
+bool _midEligible_now = scoped_inBreakoutWindow and midpointStartTolerancePct > 0 and scoped_isNearMidpoint
+bool _midWouldLatch   = _midEligible_now and barstate.isconfirmed
+bool _entryCtxAllOK   = sessionValid and not sessionBlocked and not inEarlyWindow
+
+// Emit a single, compact reason label only while we are eligible but not started yet
+if showLowLevelTrace and _midEligible_now and not scoped_officialRangeStarted
+    string _why = ""
+    _why := _why + (barstate.isconfirmed ? "" : "waiting-close")
+    _why := _why + (sessionValid ? "" : (str.length(_why) > 0 ? " | " : "") + "invalid-session")
+    _why := _why + (sessionBlocked ? (str.length(_why) > 0 ? " | " : "") + "sessionBlocked" : "")
+    //_why := _why + (tradingHalted ? (str.length(_why) > 0 ? " | " : "") + "halted" : "")
+    _why := _why + (inEarlyWindow ? (str.length(_why) > 0 ? " | " : "") + "early-window" : "")
+    // If nothing appended yet, show the “would latch now” signal
+    _why := str.length(_why) == 0 ? "would-latch-on-close" : _why
+    label.new(bar_index, high + syminfo.mintick * 60, "MidStart: " + _why, style=label.style_label_down, color=color.new(color.purple, 20), textcolor=color.white)
+
+// Data-window helpers
+plot(_midEligible_now ? 1 : 0, title="Midpoint Eligible Now", display=display.data_window, color=color.purple)
+plot(_midWouldLatch ? 1 : 0, title="Midpoint Would Latch (on close)", display=display.data_window, color=color.purple)
+plot(_entryCtxAllOK ? 1 : 0, title="Entry Context OK (post-latch)", display=display.data_window, color=color.teal)
+
+// ───────────────────────────────────────────────────────────────
+// 13) ENTRY ENGINE (dual lock: session validity + trade limit)
+// ───────────────────────────────────────────────────────────────
+if inBreakoutWindow and not drew and not na(dayHigh) and scoped_officialRangeStarted and not sessionBlocked
+    int boxLeft = scoped_actualRangeStart < rangeEnd ? rangeEnd : scoped_actualRangeStart
+    box.new(left=boxLeft, top=dayHigh, right=exitTime, bottom=dayLow, xloc=xloc.bar_time, bgcolor=sessionValid ? color.new(color.yellow, 80) : color.new(color.red, 85), border_width=0)
+    drew := true
+
+if time[0] < rangeStart or time[0] > exitTime
+    dayHigh := na
+if time[0] < rangeStart or time[0] > exitTime
+    dayLow := na
+if time[0] < rangeStart or time[0] > exitTime
+    scoped_officialRangeStarted := false
+if time[0] < rangeStart or time[0] > exitTime
+    scoped_actualRangeStart := na
+
+if inDefine
+    dayHigh := na(dayHigh) ? high : math.max(dayHigh, high)
+    dayLow  := na(dayLow)  ? low  : math.min(dayLow, low)
+
+if (not inBreakoutWindow)
+    drew := false
+
+// ───────────────────────────────────────────────────────────────
+// 15) DAILY HALTS
+// ───────────────────────────────────────────────────────────────
+// Session PnL Calculation
+f_calcSessionPL(_startTime, _endTime) =>
+    var float totalPL = 0.0
+    if not na(_startTime) and not na(_endTime) and strategy.closedtrades > 0
+        totalPL := 0.0
+        for i = 0 to strategy.closedtrades - 1
+            float eTime = strategy.closedtrades.entry_time(i)
+            if eTime >= _startTime and eTime <= _endTime
+                float entryPrice = strategy.closedtrades.entry_price(i)
+                float exitPrice = strategy.closedtrades.exit_price(i)
+                float tradeQty = math.abs(strategy.closedtrades.size(i))
+                bool isLong = strategy.closedtrades.size(i) > 0
+                float points = isLong ? (exitPrice - entryPrice) : (entryPrice - exitPrice)
+                float dollars = points / syminfo.mintick / 4 * 2 * tradeQty
+                totalPL := totalPL + dollars
+    totalPL
+
+f_calcDayPL() =>
+    var float totalDayPL = 0.0
+    yy = year(time, tzInput)
+    mm = month(time, tzInput)
+    dd = dayofmonth(time, tzInput)
+
+    // Calculate today's 15:00
+    dayStart = timestamp(tzInput, yy, mm, dd, 15, 0)
+
+    // If current time is before today's 15:00, get prior day's 15:00 using timestamp math
+    if time < dayStart
+        dayStart := dayStart - 86400000  // Subtract 1 day in milliseconds
+
+    totalDayPL := f_calcSessionPL(dayStart, time)
+
+dayPL = f_calcDayPL()
+float curLossDollars = dayPL < 0 ? -dayPL : 0.0
+
+var bool tradingHalted = false
+// Evaluate trading halt condition
+if maxDailyLoss > 0 and dayPL < -maxDailyLoss
+    tradingHalted := true
+
+if haltAfterProfit and dayPL > 0
+    tradingHalted := true
+
+if sev3Blocked
+    tradingHalted := true
+    
+// Reset flag at next global open (15:00)
+int globalOpen = timestamp(tzInput, year(time, tzInput), month(time, tzInput), dayofmonth(time, tzInput), 15, 0)
+if time >= globalOpen and time[1] < globalOpen
+    tradingHalted := false
+
+
+// ───────────────────────────────────────────────────────────────
+// 16) ENTRY & EXIT LOGIC (Dual Lock: Session Validity + Trade Limit)
+// ───────────────────────────────────────────────────────────────
+//clears per-session gates before the engine arms entries (e.g., placedTrades, 
+// waitUntilBar, postTradeLock).
+// zeroes counters (tradesToday) and snapshot vars so the data window/panel shows fresh values.
+// pairs with your EOS cleanup (which cancels orders and sets resetTimes := true) by 
+// resetting counters/flags that the EOS block doesn’t touch. see your EOS cleanup: 
+// it triggers on the first bar at/after exitTime, cancels orders, closes all, and sets resetTimes := true.
+// ───────────────────────────────────────────────────────────────
+var tradesToday = 0
+var closedTrades = 0
+var int waitUntilBar = na
+var int postTradeLock = na
+
+// Start-of-session reset — fires once at the first bar inside the new session
+if bar_index > 0 and time[1] < rangeStart and time >= rangeStart
+    placedTrades := false
+    tradesToday := 0
+    closedTrades := strategy.closedtrades
+    waitUntilBar := na
+    postTradeLock := na
+    issuedLongOrder := false
+    issuedShortOrder := false
+    lastIssuedTradeNumber_reason := "session-reset"
+    lastIssuedTradeNumber := 0
+    emergencyExitSent := false
+    earlyExitFired := false
+    proxyPosActive := false
+    proxyTickerPos := ""
+    proxyPosDir    := 0
+    proxyPosQty    := 0
+    sessionPL_snapshot := na
+    tradesToday_snapshot := na
+    sessionTable := na
+    drew := false
+    rearmAfterProfitPending := false
+    rearmEligibleFromBar := na
+    // reset frozen snapshots for the new session
+    sizingSnapTaken := false
+    sLongEntry := na
+    sShortEntry := na
+    sLongStop  := na
+    sShortStop := na
+    sLongTP    := na
+    sShortTP   := na
+    sessionSnapTaken := false
+    sessionValidFrozen := true
+    sessionInvalidReasonFrozen := ""
+    tradingHalted := false
+    // >>> PATCH G: session-begin — reset cycle state
+    cycleSide := 0
+    oppOutstanding := 0
+
+//But if the script loads mid-session (inside the range window, before that crossing logic runs), lastIssuedTradeNumber can still reflect a prior session.
+// this code is supposed to help with chart reload issues. 
+if barstate.isfirst and time >= rangeStart and time < exitTime
+    placedTrades := false
+    issuedLongOrder := false
+    issuedShortOrder := false
+    lastIssuedTradeNumber_reason := "mid-session-reset"
+    lastIssuedTradeNumber := 0
+
+
+// Reset just after session ends ✅ Executes once, on the first bar after the session ends - Ideal for resetting session state (e.g., flags, counters, UI values)
+if bar_index > 0 and time[1] < exitTime and time[0] >= exitTime
+    tradesToday := 0
+    placedTrades := false
+    closedTrades := strategy.closedtrades
+    waitUntilBar := na
+    issuedLongOrder := false
+    issuedShortOrder := false
+    // ◄◄◄ clear our trade-number gating for next session
+    lastIssuedTradeNumber_reason := "session-reset"
+    lastIssuedTradeNumber := 0
+    emergencyExitSent      := false
+    sessionPL_snapshot := na
+    tradesToday_snapshot := na
+    sessionTable := na
+    proxyPosActive := false
+    proxyTickerPos := ""
+    proxyPosDir    := 0
+    proxyPosQty    := 0
+    // >>> PATCH H: session-end — reset cycle state
+    cycleSide := 0
+    oppOutstanding := 0
+
+// ───────────────────────────────────────────────────────────────
+// 17) ENTRY ENGINE (dual lock: session validity + trade limit)
+// ───────────────────────────────────────────────────────────────
+idLong = "Long"
+idShort = "Short"
+canceledLong = false
+canceledShort = false
+
+/// ── Emergency exit block (single-latch, single-line calls)
+if realtimeEffective and not emergencyExitSent and bar_index == emergencyExitBar and (na(lastExitEmitBar) or lastExitEmitBar != bar_index)
+    bool allowExit_em = na(lastExitEmitBar) or lastExitEmitBar != bar_index
+    bool allowChart_em = allowExit_em
+    bool allowProxy_em = allowExit_em
+    string chartTkr_em = syminfo.ticker
+    string proxyTkr_em = proxyTickerPos != "" ? proxyTickerPos : f_get_proxy_ticker(chartTkr_em)
+    bool emitLabel_em = true
+    bool doCancelAll_em = true
+    bool posIsLong_em = strategy.position_size > 0
+    string thisEntry_em = posIsLong_em ? idLong : idShort
+    string thisExit_em  = posIsLong_em ? idLong + "_Exit" : idShort + "_Exit"
+    string oppPrim_em   = posIsLong_em ? idShort : idLong
+    string oppPrimEx_em = posIsLong_em ? idShort + "_Exit" : idLong + "_Exit"
+    [didExit_em_tmp, proxySent_em_tmp] = f_exit_atomic("Emergency", "Emergency Market Exit", close, time, tzInput, chartTkr_em, proxyTkr_em, emitLabel_em, doCancelAll_em, thisEntry_em, thisExit_em, oppPrim_em, oppPrimEx_em, allowChart_em, allowProxy_em)
+    if didExit_em_tmp
+        emergencyExitSent := true
+    if proxySent_em_tmp and proxyTickerPos != ""
+        proxyPosActive := false
+        proxyTickerPos := ""
+        proxyPosDir    := 0
+        proxyPosQty    := 0
+    oppTPLineActive := false
+    oppTPLineIsLong := false
+    oppTPLinePrice  := na
+    // >>> PATCH F: emergency — reset cycle state — BEGIN
+    cycleSide := 0
+    oppOutstanding := 0
+    // >>> PATCH F: emergency — reset cycle state — END
+    if didExit_em_tmp
+        lastExitEmitBar := bar_index
+    if proxySent_em_tmp
+        lastExitEmitBar := bar_index
+
+// Evaluate entry conditions each bar                                  
+bool currentPriceIsInsideRange_check = isPriceInsideRange()
+bool priceGateOK = lastIssuedTradeNumber == 0 ? true : currentPriceIsInsideRange_check
+bool allConditionsMetForTradePlacement = not tradingHalted and
+                                         sessionValid and
+                                         not sessionBlocked and
+                                         strategy.position_size == 0 and
+                                         not placedTrades and
+                                         not issuedLongOrder and
+                                         not issuedShortOrder and
+                                         // >>> CHANGE: block base placement while OppAdd is active
+                                         oppOutstanding == 0 and
+                                         (na(waitUntilBar) or bar_index >= waitUntilBar) and
+                                         (na(postTradeLock) or bar_index >= postTradeLock) and
+                                         priceGateOK and
+                                         (tradeLimit == 0 or lastIssuedTradeNumber < tradeLimit) and
+                                         (not requireMidpointReturn or tradesToday == 0 or (scoped_isNearMidpoint and barstate.isconfirmed)) // >>> CHANGE: midpoint gate close-confirmed post-Trade1 Double fire post profit bug
+
+// Allow re-arming when we come back to midpoint during deferred starts Only before the first issuance and while flat — prevents per-bar re-arming spam
+if scoped_inBreakoutWindow and midpointStartTolerancePct > 0 and scoped_isNearMidpoint and lastIssuedTradeNumber == 0 and strategy.position_size == 0
+    placedTrades := false
+
+// 17.0a) Safety: clear any stale placement latch for the very first issuance
+if inBreakoutWindow and scoped_officialRangeStarted and lastIssuedTradeNumber == 0 and strategy.position_size == 0
+    placedTrades := false
+
+if inBreakoutWindow and scoped_officialRangeStarted
+    // 🔒 Session Invalid Lock
+    if not sessionValid and not placedTrades
+        strategy.cancel(idLong)
+        strategy.cancel(idShort)
+        placedTrades := true
+
+    // 🔒 Trade Limit Lock (by set count)
+    if tradeLimit > 0 and lastIssuedTradeNumber >= tradeLimit and not placedTrades
+        strategy.cancel(idLong)
+        strategy.cancel(idShort)
+        placedTrades := true
+
+
+    // ── ENTRY PLACEMENT (trade-number gating) ──
+    int nextTradeNum = lastIssuedTradeNumber + 1
+    bool wasZeroIssued = not issuedLongOrder and not issuedShortOrder
+
+    if allConditionsMetForTradePlacement and bar_index != lastEntryBar and nextTradeNum > lastIssuedTradeNumber
+        lastEntryBar := bar_index
+        bool placedL = f_placeBracket(idLong,  strategy.long,  useLongEntry,  useLongStop,  useLongTP,  lastIssuedTradeNumber, issuedLongOrder,  true, curLossDollars)
+        bool placedS = f_placeBracket(idShort, strategy.short, useShortEntry, useShortStop, useShortTP, lastIssuedTradeNumber, issuedShortOrder, true, curLossDollars)
+
+        bool anyPlaced = placedL or placedS
+
+        if placedL
+            issuedLongOrder := true
+            placedTrades := true
+        if placedS
+            issuedShortOrder := true
+            placedTrades := true
+
+        // Bump ONLY when leaving the 0-order state; set reason here (not earlier)
+        int _prevNum = lastIssuedTradeNumber
+        if wasZeroIssued and anyPlaced
+            lastIssuedTradeNumber_reason := _prevNum == 0 ? "initial-place" : "cycle-start"
+            lastIssuedTradeNumber := nextTradeNum
+        else
+            lastIssuedTradeNumber_reason := "no-bump-not-zero"
+            lastIssuedTradeNumber := lastIssuedTradeNumber
+
+        // latch §12 invariants only when a side actually places
+        if placedL and na(scoped_actualRangeStart)
+            scoped_actualRangeStart := time
+        if placedL and not scoped_officialRangeStarted
+            scoped_officialRangeStarted := true
+        if placedS and na(scoped_actualRangeStart)
+            scoped_actualRangeStart := time
+        if placedS and not scoped_officialRangeStarted
+            scoped_officialRangeStarted := true
+
+        // Auto-clear the post-trade lock once elapsed
+        if not na(postTradeLock) and bar_index >= postTradeLock
+            postTradeLock := na
+            issuedLongOrder := false
+            issuedShortOrder := false
+
+
+// ───────────────────────────────────────────────────────────────
+// 17.2) OPEN TRADE HANDLER — Immediate Opposite Reissue (Single-Policy)
+//       • No N+1 scheduler; issue on entry bar if guards pass
+//       • Uses adjusted entry/SL and scaled TP via oppositeTpOverride (if >= 0)
+// ───────────────────────────────────────────────────────────────
+
+// Position transition detection (declare once; update each bar)
+var int  posNow172 = 0
+var int  posPrev172 = 0
+var bool wasFlat172 = false
+var bool enteredLongNow172 = false
+var bool enteredShortNow172 = false
+var bool reattached172 = false
+
+posNow172 := int(math.round(nz(strategy.position_size)))
+posPrev172 := int(math.round(nz(strategy.position_size[1])))
+wasFlat172 := posPrev172 == 0
+enteredLongNow172  := (posPrev172 <= 0) and posNow172 > 0
+enteredShortNow172 := (posPrev172 >= 0) and posNow172 < 0
+// >>> CHANGE: clear outstanding flag the moment any new entry fills (includes OppAdd fill at 06:38)
+if oppOutstanding != 0 and (enteredLongNow172 or enteredShortNow172)
+    oppOutstanding := 0
+
+// --- Intra-bar entry pulse hardening (chart-only; no proxy) ---//for single bar flips
+var int  barId172 = na
+var int  posAtBarOpen172 = 0
+var bool seenNonZeroThisBar172 = false
+var int  entryQtySnap172 = na
+
+if na(barId172) or bar_index != barId172
+    barId172 := bar_index
+    posAtBarOpen172 := int(math.round(nz(strategy.position_size[1])))
+    seenNonZeroThisBar172 := false
+    entryQtySnap172 := na
+
+bool enteredLongNow172_ib  = false
+bool enteredShortNow172_ib = false
+if posAtBarOpen172 == 0 and not seenNonZeroThisBar172 and strategy.position_size != 0
+    seenNonZeroThisBar172 := true
+    int _snapPos172 = int(math.round(nz(strategy.position_size)))
+    enteredLongNow172_ib  := _snapPos172 > 0
+    enteredShortNow172_ib := _snapPos172 < 0
+    entryQtySnap172 := int(math.abs(_snapPos172))
+
+enteredLongNow172  := enteredLongNow172  or enteredLongNow172_ib
+enteredShortNow172 := enteredShortNow172 or enteredShortNow172_ib
+
+
+// PROFIT stand-down detection (compute every bar; lets 17.4 reissue both if profit close just happened)
+int  ct172 = strategy.closedtrades
+bool ctChanged172 = ta.change(ct172) != 0
+bool profitClosedThisBar172 = false
+if ctChanged172 and ct172 > 0
+    float _exitP172  = strategy.closedtrades.exit_price(ct172 - 1)
+    float _entryP172 = strategy.closedtrades.entry_price(ct172 - 1)
+    bool  _long172   = strategy.closedtrades.size(ct172 - 1) > 0
+    profitClosedThisBar172 := _long172 ? (_exitP172 > _entryP172) : (_exitP172 < _entryP172)
+
+// >>> CHANGE: synthesize entry pulse for historical same-bar STOP (entry+STOP on one candle)
+// Only when we were flat at bar open and flat at close, and the close was a STOP (not profit)
+bool stopClosedThisBar172 = ctChanged172 and ct172 > 0 and not profitClosedThisBar172
+bool fallbackPulse172 = false
+int  fallbackDir172 = 0
+if stopClosedThisBar172 and wasFlat172 and strategy.position_size == 0
+    float _szClosed172 = strategy.closedtrades.size(ct172 - 1)
+    fallbackDir172 := _szClosed172 > 0.0 ? -1 : 1
+    fallbackPulse172 := true
+
+// Shared locals (17.2-scoped)
+var float reOppEntry172 = na
+var float reOppStop172  = na
+var float reOppTP172    = na
+var float reOppQty172   = na
+var string reOppId172   = ""
+var string reOppExitId172 = ""
+
+float mt172 = syminfo.mintick != 0.0 ? syminfo.mintick : 0.01
+bool  capOK172 = true
+
+// Unified block flag: honor Sev/news-day block, invalid session, and global halt
+bool oppBlocked172 = not sessionValidFrozen or sessionBlocked or not sessionValid or tradingHalted
+// >>> CHANGE: precompute adjusted OppAdd stops from original entry↔stop distances; entry & TP unchanged
+float _oppAddFrac172 = oppAddStopPct / 100.0
+float _longDist172 = not na(useLongEntry) and not na(useLongStop) ? math.abs(useLongEntry - useLongStop) : na
+float _shortDist172 = not na(useShortEntry) and not na(useShortStop) ? math.abs(useShortStop - useShortEntry) : na
+float oppLongStopAdj172 = not na(_longDist172) and not na(useLongEntry) ? useLongEntry - (_longDist172 * _oppAddFrac172) : na
+float oppShortStopAdj172 = not na(_shortDist172) and not na(useShortEntry) ? useShortEntry + (_shortDist172 * _oppAddFrac172) : na
+
+// >>> CHANGE: visibility-gated adjusted OppAdd stop guides (show only when OppAdd TP lines are active)
+bool  _showAdjStops172 = oppTPLineActive
+float pOppLongStopAdj172  = _showAdjStops172 ? oppLongStopAdj172  : na
+float pOppShortStopAdj172 = _showAdjStops172 ? oppShortStopAdj172 : na
+plot(pOppLongStopAdj172,  title = "Opp Add Long Stop (Adj)",  style = plot.style_linebr, color = color.new(color.yellow, 60))
+plot(pOppShortStopAdj172, title = "Opp Add Short Stop (Adj)", style = plot.style_linebr, color = color.new(color.orange, 60))
+
+// >>> CHANGE: Data Window field for active Recoup Trade Stop (mirrors OppAdd visibility)
+bool  _showRecoupDW172 = oppTPLineActive
+float recoupTradeStop172 = _showRecoupDW172 ? (not na(pOppLongStopAdj172) ? pOppLongStopAdj172 : not na(pOppShortStopAdj172) ? pOppShortStopAdj172 : na) : na
+plot(recoupTradeStop172, title = "Recoup Trade Stop", display = display.data_window, color = color.new(color.gray, 0))
+
+// Entry-bar pulse: true only on the bar a real position opens (your current detector)
+bool entryPulse172 = enteredLongNow172 or enteredShortNow172
+
+// §17.2 — effective start is live start OR a recorded actualRangeStart (latch w/out new globals)
+bool officialStartEffective = scoped_officialRangeStarted or not na(scoped_actualRangeStart)
+bool ctxOKBase172 = inBreakoutWindow and officialStartEffective and sessionValidFrozen
+int dirOpp172 = enteredShortNow172 ? 1 : enteredLongNow172 ? -1 : 0
+//  Apply fallback pulse for same-bar STOP
+if not entryPulse172 and fallbackPulse172 and dirOpp172 == 0
+    dirOpp172 := fallbackDir172
+    entryPulse172 := true
+// >>> PATCH H1: intra-bar flip fallback — INSERTED
+if dirOpp172 == 0 and posNow172 != 0
+    dirOpp172 := posNow172 < 0 ? 1 : -1
+// >>> PATCH H1 — END
+
+// 🟧 PATCH: define effective opposite-entry offset (negative => auto-match legacy entryOff - stopOff)
+float effOppOffsetPts172 = oppositeReissueEntryOffsetPts >= 0.0 ? oppositeReissueEntryOffsetPts : (entryOff - stopOff)
+effOppOffsetPts172 := math.max(0.0, effOppOffsetPts172)  // 🟥 PATCH: non-negative guard
+
+bool ctxOKOppAdd172 = ctxOKBase172 and not oppTPLineActive
+if dirOpp172 != 0 and ctxOKOppAdd172
+    // If profit close detected on this bar, stand down and let 17.4 handle both sides
+    if profitClosedThisBar172
+        reOppTP172 := reOppTP172  // no-op to satisfy non-empty branch rule
+    else
+        if true
+            if oppBlocked172
+                if showOppositeDebugLabels
+                    label.new(bar_index, close, "Immediate: Skipped (blocked/invalid/halt)", style=label.style_label_down, color=color.new(color.red, 20), textcolor=color.white)
+            else
+                // LONG add on proxy when we just entered SHORT micro
+                if dirOpp172 == 1
+                    //reOppEntry172 := useLongEntry //revert because getting greedy on the entry doesnt respect the levels
+                    reOppEntry172 := math.round((useShortStop + effOppOffsetPts172) / mt172) * mt172  // 🟧 PATCH: Opp LONG entry Δ above short stop
+                    
+                    reOppStop172  := oppLongStopAdj172  // >>> CHANGE: scaled OppAdd stop
+                    reOppTP172    := reOppEntry172 + useTpSizeOpp
+
+                    bool haveAllL172 = not na(reOppEntry172) and not na(reOppStop172) and not na(reOppTP172)
+                    bool distOKL172 = true
+                    // Size from the EXISTING short leg's actual $ risk; hit target = baseRisk × oppositeQtyMultiplier
+                    int   qtyExistMicroL   = int(math.abs(posNow172))
+                    if entryPulse172 and qtyExistMicroL <= 0
+                        qtyExistMicroL := int(math.abs(nz(entryQtySnap172, 0)))
+                    // >>> CHANGE: same-bar STOP fallback — use actual closed trade size if latch is empty
+                    float _qtyClosedThisBarL172 = ct172 > 0 ? math.abs(strategy.closedtrades.size(ct172 - 1)) : 0.0
+                    if entryPulse172 and stopClosedThisBar172 and qtyExistMicroL <= 0
+                        qtyExistMicroL := int(_qtyClosedThisBarL172)
+
+                    // Size from the EXISTING short leg's risk (unchanged logic up to intended qty) …
+                    float baseRiskExistL   = f_calcTradeRiskDollars(useShortEntry, useShortStop, qtyExistMicroL)
+                    float riskPerMicroOppL = f_calcTradeRiskDollars(useLongEntry,  useLongStop,  1)
+                    float addRiskL         = baseRiskExistL * oppositeQtyMultiplier - baseRiskExistL
+                    int   qMicroAddL_raw   = addRiskL > 0 and riskPerMicroOppL > 0 ? int(math.ceil(addRiskL / riskPerMicroOppL)) : 0
+                    if minimumOneContract and addRiskL > 0 and qMicroAddL_raw <= 0
+                        qMicroAddL_raw := 1
+
+                    // 🟧 PATCH: backtest-only neutralizer — subtract the opposite position seen *now*
+                    int qMicroAddL = qMicroAddL_raw                                         // 🟧 PATCH: start with intended qty
+                    if not barstate.isrealtime and posNow172 < 0 and qMicroAddL > 0                      // 🟧 PATCH: only when LONG add would reverse a SHORT
+                        qMicroAddL := math.max(0, qMicroAddL - math.abs(posNow172))         // 🟧 PATCH: request less so freeze == intended
+
+
+                    int   qFullAddL        = int(math.max(0, math.floor(qMicroAddL * proxyQtyMul)))
+                    float microEqQtyL      = float(qMicroAddL)
+
+                    bool riskOKL172 = f_projectedRiskOK(reOppEntry172, reOppStop172, microEqQtyL, curLossDollars)
+                    if haveAllL172 and distOKL172 and capOK172 and riskOKL172 and ((barstate.isrealtime and qFullAddL > 0) or (not barstate.isrealtime and qMicroAddL > 0))
+                        // Arm the opposite-TP overlay line for plotting
+                        oppTPLineActive := true
+                        oppTPLineIsLong := true
+                        oppTPLinePrice  := reOppTP172
+                        string labelTkrL172 = useProxyRealtimeOnly and realtimeEffective ? f_get_proxy_ticker(syminfo.ticker) : syminfo.ticker
+                        bool _placedL172 = f_send_opposite_on_proxy(labelTkrL172, true, reOppEntry172, reOppStop172, reOppTP172, qMicroAddL, proxyQtyMul, oppBlocked172)
+                        // >>> CHANGE: mark opposite order as outstanding so base placer stands down
+                        if _placedL172
+                            oppOutstanding := 1
+                        if _placedL172 and useProxyRealtimeOnly and realtimeEffective
+                            proxyPosActive := true
+                            proxyTickerPos := labelTkrL172
+                            proxyPosDir    := 1
+                            proxyPosQty    := qFullAddL
+
+                        if showOppositeDebugLabels
+                            int shownQtyL172 = useProxyRealtimeOnly and realtimeEffective ? qFullAddL : qMicroAddL
+                            label.new(bar_index, close, "Opp Add LONG " + labelTkrL172 + " x" + str.tostring(shownQtyL172), style=label.style_label_up, color=color.new(color.green, 20), textcolor=color.white)
+                    else
+                        if showOppositeDebugLabels and entryPulse172 and not oppTPLineActive
+                            string why =
+                                 oppBlocked172 ? "blocked" :
+                                 not haveAllL172 ? "levels" :
+                                 not capOK172 ? "limit" :
+                                 not riskOKL172 ? "risk" :
+                                 ((barstate.isrealtime and qFullAddL <= 0) or (not barstate.isrealtime and qMicroAddL <= 0)) ? "qty=0" :
+                                 "unknown"
+                            label.new(bar_index, close,
+                                 "Opp Add LONG skipped: " + why,
+                                 style=label.style_label_down, color=color.new(color.red, 20), textcolor=color.white)
+                // SHORT add on proxy when we just entered LONG micro
+                if dirOpp172 == -1
+                    //reOppEntry172 := useShortEntry //reverted to get less greedy
+                    reOppEntry172 := math.round((useLongStop - effOppOffsetPts172) / mt172) * mt172  // 🟧 PATCH: Opp SHORT entry Δ below long stop
+                    reOppStop172  := useShortStop
+                    reOppStop172  := oppShortStopAdj172 // >>> CHANGE: scaled OppAdd stop
+                    reOppTP172    := reOppEntry172 - useTpSizeOpp
+                    bool haveAllS172 = not na(reOppEntry172) and not na(reOppStop172) and not na(reOppTP172)
+                    bool distOKS172 = true
+                    // Size from the EXISTING long leg's actual $ risk; hit target = baseRisk × oppositeQtyMultiplier
+                    int   qtyExistMicroS   = int(math.abs(posNow172))
+                    if entryPulse172 and qtyExistMicroS <= 0
+                        qtyExistMicroS := int(math.abs(nz(entryQtySnap172, 0)))
+                    // >>> CHANGE: same-bar STOP fallback — use actual closed trade size if latch is empty
+                    float _qtyClosedThisBarS172 = ct172 > 0 ? math.abs(strategy.closedtrades.size(ct172 - 1)) : 0.0
+                    if entryPulse172 and stopClosedThisBar172 and qtyExistMicroS <= 0
+                        qtyExistMicroS := int(_qtyClosedThisBarS172)
+            
+                    float baseRiskExistS   = f_calcTradeRiskDollars(useLongEntry, useLongStop, qtyExistMicroS)
+                    float riskPerMicroOppS = f_calcTradeRiskDollars(useShortEntry, useShortStop, 1)
+                    float addRiskS         = baseRiskExistS * oppositeQtyMultiplier - baseRiskExistS
+                    int   qMicroAddS_raw   = addRiskS > 0 and riskPerMicroOppS > 0 ? int(math.ceil(addRiskS / riskPerMicroOppS)) : 0
+                    if minimumOneContract and addRiskS > 0 and qMicroAddS_raw <= 0
+                        qMicroAddS_raw := 1
+
+                    // 🟧 PATCH: backtest-only neutralizer — subtract the opposite position seen *now*
+                    int qMicroAddS = qMicroAddS_raw                                         // 🟧 PATCH: start with intended qty
+                    if not barstate.isrealtime and posNow172 > 0 and qMicroAddS > 0                      // 🟧 PATCH: only when SHORT add would reverse a LONG
+                        qMicroAddS := math.max(0, qMicroAddS - math.abs(posNow172))         // 🟧 PATCH: request less so freeze == intended
+
+                    int   qFullAddS        = int(math.max(0, math.floor(qMicroAddS * proxyQtyMul)))
+                    float microEqQtyS      = float(qMicroAddS)
+
+                    bool riskOKS172 = f_projectedRiskOK(reOppEntry172, reOppStop172, microEqQtyS, curLossDollars)
+                    if haveAllS172 and distOKS172 and capOK172 and riskOKS172 and ((barstate.isrealtime and qFullAddS > 0) or (not barstate.isrealtime and qMicroAddS > 0))
+                        // Arm the opposite-TP overlay line for plotting
+                        oppTPLineActive := true
+                        oppTPLineIsLong := false
+                        oppTPLinePrice  := reOppTP172
+                        string labelTkrS172 = useProxyRealtimeOnly and realtimeEffective ? f_get_proxy_ticker(syminfo.ticker) : syminfo.ticker
+                        bool _placedS172 = f_send_opposite_on_proxy(labelTkrS172, false, reOppEntry172, reOppStop172, reOppTP172, qMicroAddS, proxyQtyMul, oppBlocked172)
+                        // >>> CHANGE: mark opposite order as outstanding so base placer stands down
+                        if _placedS172
+                            oppOutstanding := 1
+                        if _placedS172 and useProxyRealtimeOnly and realtimeEffective
+                            proxyPosActive := true
+                            proxyTickerPos := labelTkrS172
+                            proxyPosDir    := -1
+                            proxyPosQty    := qFullAddS
+                        if showOppositeDebugLabels
+                            int shownQtyS172 = useProxyRealtimeOnly and realtimeEffective ? qFullAddS : qMicroAddS
+                            label.new(bar_index, close, "Opp Add SHORT " + labelTkrS172 + " x" + str.tostring(shownQtyS172), style=label.style_label_down, color=color.new(color.green, 20), textcolor=color.white)
+                    else
+                        if showOppositeDebugLabels and entryPulse172
+                            string why =
+                                 oppBlocked172 ? "blocked" :
+                                 not haveAllS172 ? "levels" :
+                                 not capOK172 ? "limit" :
+                                 not riskOKS172 ? "risk" :
+                                 ((barstate.isrealtime and qFullAddS <= 0) or (not barstate.isrealtime and qMicroAddS <= 0)) ? "qty=0" :
+                                 "unknown"
+                            label.new(bar_index, close,
+                                 "Opp Add SHORT skipped: " + why,
+                                 style=label.style_label_down, color=color.new(color.red, 20), textcolor=color.white)
+
+else
+    // Only emit a reason label on actual entry bars; avoids label buffer burn on other bars
+    if showLowLevelTrace and entryPulse172
+        string miss172 =
+                 not inBreakoutWindow       ? "inBreakoutWindow=false" :
+                 not officialStartEffective ? "officialStartEffective=false" :
+                 not sessionValidFrozen     ? "sessionValidFrozen=false" :
+                 oppBlocked172              ? "oppBlocked" :
+                 oppTPLineActive            ? "oppTPActive" :
+                                           "unknown"
+
+        label.new(bar_index, close,
+                  "Opp Add skipped (ctx): " + miss172,
+                  style=label.style_label_down, color=color.new(color.gray, 20), textcolor=color.white)
+
+// >>> PATCH B: §17.2 Entry Snapshot — BEGIN
+// On the bar a real position opens, record initial side and how many opposite orders are now “in flight”
+if entryPulse172
+    cycleSide := enteredLongNow172 ? 1 : -1
+    oppOutstanding := 1
+    bool _oppIssued172 = oppTPLineActive
+    if _oppIssued172
+        oppOutstanding := oppOutstanding + 1
+// >>> PATCH B: §17.2 Entry Snapshot — END
+
+
+// ───────────────────────────────────────────────────────────────
+// 17.4)── CLOSED TRADE HANDLER: split PROFIT vs STOP, and respect aggressiveFlip toggle ──
+// ───────────────────────────────────────────────────────────────
+
+if strategy.closedtrades > closedTrades
+    closedTrades := strategy.closedtrades
+    tradesToday := tradesToday + 1
+    int _nextNum = lastIssuedTradeNumber + 1
+    placedTrades := placedTrades
+
+    float _exit  = strategy.closedtrades.exit_price(strategy.closedtrades - 1)
+    float _entry = strategy.closedtrades.entry_price(strategy.closedtrades - 1)
+    bool  _long  = strategy.closedtrades.size(strategy.closedtrades - 1) > 0
+    bool  wasProfit = _long ? (_exit > _entry) : (_exit < _entry)
+
+    // >>> PATCH C: §17.4 Opposite-cycle gate — BEGIN
+    int  lastIdx174 = strategy.closedtrades - 1
+    int  lastDir174 = strategy.closedtrades.size(lastIdx174) > 0 ? 1 : -1
+    if lastDir174 == -cycleSide
+        oppOutstanding := math.max(oppOutstanding - 1, 0)
+    bool allowProfitRearm174 = lastDir174 == cycleSide or (lastDir174 == -cycleSide and oppOutstanding == 0)
+    // >>> PATCH C: §17.4 Opposite-cycle gate — END
+
+    // capture context BEFORE any resets so we can reissue on PROFIT
+    bool _ctxAny = inBreakoutWindow and scoped_officialRangeStarted and not earlyExitFired and not emergencyExitSent and not sessionBlocked and not tradingHalted
+    bool _tradeLimitOK = tradeLimit == 0 or lastIssuedTradeNumber < tradeLimit
+
+    // midpoint + early-exit guard
+    bool _midOK  = not requireMidpointReturn or tradesToday == 0 or (scoped_isNearMidpoint and barstate.isconfirmed) // >>> CHANGE: midpoint gate close-confirmed post-Trade1
+    bool _ctxGate = _ctxAny and _midOK and not inEarlyWindow
+
+    // 🟧 CHANGE: decouple emit vs re-arm; always EXIT on profit, re-arm policy still uses allowProfitRearm174
+    bool profitExitGate174 = wasProfit // 🟧
+    bool profitRearmGate174 = wasProfit and allowProfitRearm174 and _ctxGate and _tradeLimitOK // 🟧
+
+
+    if profitExitGate174
+        // ► PROFIT (or toggle OFF): original cleanup + early-exit scheduling preserved
+        if not earlyExitFired
+            emergencyExitBar := bar_index + 1
+            emergencyExitSent := false
+            waitUntilBar := bar_index + 1
+            postTradeLock := bar_index + 3
+        issuedLongOrder := false
+        issuedShortOrder := false
+
+        // 🟧 CHANGE: derive IDs from the CLOSED trade's direction (current position is flat on TP)
+        bool _closedWasLong_pf = _long // 🟧
+        string _thisEntry_pf = _closedWasLong_pf ? idLong : idShort // 🟧
+        string _thisExit_pf = _closedWasLong_pf ? idLong + "_Exit" : idShort + "_Exit" // 🟧
+        string _oppPrim_pf = _closedWasLong_pf ? idShort : idLong // 🟧
+        string _oppPrimEx_pf = _closedWasLong_pf ? idShort + "_Exit" : idLong + "_Exit" // 🟧
+
+        // 🟧 CHANGE: rely on f_exit_atomic for cancel+JSON (no mid-block strategy.cancel)
+        
+        // Atomic profit flatten + emits (chart + proxy when live)
+        string chartTkr_pf = syminfo.ticker
+        string proxyTkr_pf = proxyTickerPos != "" ? proxyTickerPos : f_get_proxy_ticker(chartTkr_pf)
+        bool emitLabel_pf = true
+        bool doCancelAll_pf = true
+
+        bool posIsLong_pf = strategy.position_size > 0
+        string thisEntry_pf = posIsLong_pf ? idLong : idShort
+        string thisExit_pf  = posIsLong_pf ? idLong + "_Exit" : idShort + "_Exit"
+        string oppPrim_pf   = posIsLong_pf ? idShort : idLong
+        string oppPrimEx_pf = posIsLong_pf ? idShort + "_Exit" : idLong + "_Exit"
+
+        // Single-latch de-dupe for this bar
+        bool allowExit_pf = na(lastExitEmitBar) or lastExitEmitBar != bar_index
+        bool allowChart_pf = allowExit_pf
+        bool allowProxy_pf = allowExit_pf
+        
+        [didExit_pf_tmp, proxySent_pf_tmp] =
+             f_exit_atomic("ProfitTP","Profit Path Flatten",close,time,tzInput,chartTkr_pf,proxyTkr_pf,emitLabel_pf,doCancelAll_pf,thisEntry_pf,thisExit_pf,oppPrim_pf,oppPrimEx_pf,allowChart_pf,allowProxy_pf)
+        if didExit_pf_tmp
+            lastExitEmitBar := bar_index
+        if proxySent_pf_tmp and proxyTickerPos != ""
+            proxyPosActive := false
+            proxyTickerPos := ""
+            proxyPosDir    := 0
+            proxyPosQty    := 0
+
+        // Drop any stale Opp TP overlay so next OppAdd can arm
+        oppTPLineActive := false
+        oppTPLineIsLong := false
+        oppTPLinePrice  := na
+
+        // Reissue both brackets immediately on PROFIT — midpoint-gated downstream
+        placedTrades := false
+        bool _placedL = false
+        bool _placedS = false
+
+        if _ctxGate and _tradeLimitOK and oppOutstanding == 0
+            _placedL := f_placeBracket(idLong,  strategy.long,  longEntry,  longStop,  longTP,  lastIssuedTradeNumber, false, _ctxGate, curLossDollars)
+            _placedS := f_placeBracket(idShort, strategy.short, shortEntry, shortStop, shortTP, lastIssuedTradeNumber, false, _ctxGate, curLossDollars)
+
+            if _placedL or _placedS
+                lastIssuedTradeNumber_reason := "closed-trade-reissue"
+                lastIssuedTradeNumber := lastIssuedTradeNumber + 1
+                lastEntryBar := bar_index
+                placedTrades := true
+                rearmAfterProfitPending := false
+                rearmEligibleFromBar    := na
+                if showLowLevelTrace
+                    label.new(bar_index, low - syminfo.mintick * 120, "Exit: Profit — reissued both brackets", style=label.style_label_down, color=color.teal, textcolor=color.white)
+            // >>> PATCH E1: reset cycle state after profit re-arm — BEGIN
+            cycleSide := 0
+            oppOutstanding := 0
+            // >>> PATCH E1: reset cycle state after profit re-arm — END
+
+        else
+            if showLowLevelTrace
+                label.new(bar_index, low - syminfo.mintick * 120, "Exit: Profit — gating blocked reissue", style = label.style_label_down, color = color.new(color.green, 60), textcolor = color.white)
+            bool needProxyOnly_e174 = useProxyRealtimeOnly and realtimeEffective and proxyPosActive and str.length(proxyTickerPos) > 0
+            if needProxyOnly_e174
+                bool allowExit_guard = na(lastExitEmitBar) or lastExitEmitBar != bar_index
+                bool allowChart_guard = false
+                bool allowProxy_guard = allowExit_guard
+                [_, proxySent_pf_guard] = f_exit_atomic("ProfitTP-Guard", "Proxy Only Exit", close, time, tzInput, "", proxyTickerPos, false, false, "", "", "", "", allowChart_guard, allowProxy_guard)
+                if proxySent_pf_guard
+                    lastExitEmitBar := bar_index
+                if proxySent_pf_guard and proxyTickerPos != ""
+                    proxyPosActive := false
+                if proxySent_pf_guard and proxyTickerPos != ""
+                    proxyTickerPos := ""
+                if proxySent_pf_guard and proxyTickerPos != ""
+                    proxyPosDir := 0
+                if proxySent_pf_guard and proxyTickerPos != ""
+                    proxyPosQty := 0
+            oppTPLineActive := false
+            oppTPLineIsLong := false
+            oppTPLinePrice := na
+            rearmAfterProfitPending := true
+            rearmEligibleFromBar := bar_index + 1
+            // >>> PATCH E2: reset cycle state after deferred profit — BEGIN
+            cycleSide := 0
+            oppOutstanding := 0
+            // >>> PATCH E2: reset cycle state after deferred profit — END
+
+    else
+       // ► STOP (toggle ON): keep opposite eligible — re-arm only when both sides have failed
+        waitUntilBar := bar_index + 1
+        postTradeLock := bar_index + 1
+
+        // Clear the side that just stopped; leave the opposite side as-is.
+        // First stop → opposite side remains issued; second stop → both become false → re-arm.
+        if _long
+            issuedLongOrder := false
+        else
+            issuedShortOrder := false
+
+        // Re-arm only when neither side is currently issued (i.e., after the opposite also stops).
+        if not issuedLongOrder and not issuedShortOrder
+            placedTrades := false
+            // Optional whipsaw safety: wait 1 more bar before any new placement.
+            waitUntilBar := bar_index + 1
+
+        if _long
+            strategy.cancel(idLong)
+            strategy.cancel(idLong + "_Exit")
+        else
+            strategy.cancel(idShort)
+            strategy.cancel(idShort + "_Exit")
+
+        // NEW: inside early-exit window, do NOT keep/reissue the opposite — cancel it too and stand down
+        if inEarlyWindow
+            strategy.cancel_all()
+            strategy.cancel(idLong)
+            strategy.cancel(idLong + "_Exit")
+            strategy.cancel(idShort)
+            strategy.cancel(idShort + "_Exit")
+            placedTrades := true
+            if showLowLevelTrace
+                label.new(bar_index, high + syminfo.mintick * 120, "Exit: Stop — Early Window → no opposite", style=label.style_label_down, color=color.new(color.red, 10), textcolor=color.white)
+        else
+            if showLowLevelTrace
+                label.new(bar_index, high + syminfo.mintick * 120, "Exit: Stop-Out — opposite left in place", style=label.style_label_down, color=color.teal, textcolor=color.white)
+            
+    // (Optional) immediate lock clears if already elapsed
+    if not na(waitUntilBar) and bar_index >= waitUntilBar
+        waitUntilBar := na
+    if not na(postTradeLock) and bar_index >= postTradeLock
+        postTradeLock := na
+
+// ───────────────────────────────────────────────────────────────
+// 17.6) Deferred re-arm after PROFIT (midpoint-gated)
+//      If immediate reissue was blocked by midpoint gating, wait until:
+//      • flat, • locks cleared, • trade limit OK, • midpoint OK, • still inside session
+//      Then place both brackets via f_placeBracket (restores orange label).
+// ───────────────────────────────────────────────────────────────
+bool _rearmLocksClear  = (na(waitUntilBar) or bar_index >= waitUntilBar) and (na(postTradeLock) or bar_index >= postTradeLock)
+bool _rearmCtx         = inBreakoutWindow and scoped_officialRangeStarted and not inEarlyWindow and not earlyExitFired and not emergencyExitSent and not sessionBlocked and not tradingHalted
+bool _rearmMidOK       = not requireMidpointReturn or scoped_isNearMidpoint
+bool _rearmLimitOK     = tradeLimit == 0 or  lastIssuedTradeNumber < tradeLimit
+bool _rearmCanPlace = rearmAfterProfitPending
+                      and strategy.position_size == 0
+                      and not placedTrades
+                      and oppOutstanding == 0
+                      and not issuedLongOrder and not issuedShortOrder
+                      and _rearmCtx and _rearmMidOK and _rearmLimitOK and _rearmLocksClear
+                      and (na(rearmEligibleFromBar) or bar_index >= rearmEligibleFromBar)
+                      and barstate.isconfirmed
+
+if _rearmCanPlace
+    bool _wasZero = not issuedLongOrder and not issuedShortOrder
+    bool _pL2 = f_placeBracket(idLong,  strategy.long,  longEntry,  longStop,  longTP,  lastIssuedTradeNumber, false, true, curLossDollars)
+    bool _pS2 = f_placeBracket(idShort, strategy.short, shortEntry, shortStop, shortTP, lastIssuedTradeNumber, false, true, curLossDollars)
+    if _pL2 or _pS2
+        if _wasZero
+            lastIssuedTradeNumber_reason := "deferred-rearm-from-zero"
+            lastIssuedTradeNumber := lastIssuedTradeNumber + 1
+        else
+            lastIssuedTradeNumber_reason := "deferred-rearm"
+        lastEntryBar := bar_index
+        placedTrades := true
+    rearmAfterProfitPending := false
+    rearmEligibleFromBar    := na
+
+// ───────────────────────────────────────────────────────────────
+// 17.7) PAIRED EXIT: when the proxy (YM) recoup hits its TP, exit the MYM leg too
+// ───────────────────────────────────────────────────────────────
+bool oppTPHitLong  = oppTPLineActive and  oppTPLineIsLong and not na(oppTPLinePrice) and high >= oppTPLinePrice
+bool oppTPHitShort = oppTPLineActive and not oppTPLineIsLong and not na(oppTPLinePrice) and low  <= oppTPLinePrice
+bool oppTPHitNow   = oppTPHitLong or oppTPHitShort
+
+if oppTPHitNow
+    string chartTkr_px = syminfo.ticker
+    string proxyTkr_px = proxyTickerPos != "" ? proxyTickerPos : f_get_proxy_ticker(chartTkr_px)
+    bool emitLabel_px = true
+    bool doCancelAll_px = true
+
+    bool posIsLong_px = strategy.position_size > 0
+    string thisEntry_px = posIsLong_px ? idLong : idShort
+    string thisExit_px  = posIsLong_px ? idLong + "_Exit" : idShort + "_Exit"
+    string oppPrim_px   = posIsLong_px ? idShort : idLong
+    string oppPrimEx_px = posIsLong_px ? idShort + "_Exit" : idLong + "_Exit"
+
+    bool allowExit_px = na(lastExitEmitBar) or lastExitEmitBar != bar_index
+    bool allowChart_px = allowExit_px
+    bool allowProxy_px = allowExit_px
+
+    [didExit_px_tmp, proxySent_px_tmp] = f_exit_atomic("PairedExit: Proxy TP", "Paired Exit", nz(oppTPLinePrice, close), time, tzInput, chartTkr_px, proxyTkr_px, emitLabel_px, doCancelAll_px, thisEntry_px, thisExit_px, oppPrim_px, oppPrimEx_px, allowChart_px, allowProxy_px)
+
+    if didExit_px_tmp
+        lastExitEmitBar := bar_index
+    if proxySent_px_tmp and proxyTickerPos != ""
+        proxyPosActive := false
+    if proxySent_px_tmp and proxyTickerPos != ""
+        proxyTickerPos := ""
+    if proxySent_px_tmp and proxyTickerPos != ""
+        proxyPosDir := 0
+    if proxySent_px_tmp and proxyTickerPos != ""
+        proxyPosQty := 0
+
+    oppTPLineActive := false
+    oppTPLineIsLong := false
+    oppTPLinePrice  := na
+    waitUntilBar := bar_index + 1
+    postTradeLock := bar_index + 2
+    rearmAfterProfitPending := true
+    rearmEligibleFromBar := bar_index + 1
+    placedTrades := false
+
+// ───────────────────────────────────────────────────────────────
+// 17.8) Abort if we are nearing the end of session and are postive, bail!!
+// ───────────────────────────────────────────────────────────────
+
+earlyExitTime = exitTime - earlyExitMinutes * 60000
+// ── DEBUG: show when the early-exit window opens (once)
+if showLowLevelTrace and not na(earlyExitTime) and time >= earlyExitTime and time[1] < earlyExitTime
+    label.new(bar_index, high + syminfo.mintick * 40, "Early Window Open → " + f_iso_local(earlyExitTime, tzInput), style=label.style_label_down, color=color.new(color.gray, 20), textcolor=color.white)
+
+if not earlyExitFired and time >= earlyExitTime and time < exitTime and strategy.position_size != 0
+    float avgPrice = strategy.position_avg_price
+    bool isLongPos = strategy.position_size > 0
+    //If you’re long (isLongPos == true), it tests close > avgPrice.
+    //If you’re short (isLongPos == false), it tests close < avgPrice.
+    bool inProfit  = isLongPos ? close > avgPrice : close < avgPrice
+    if inProfit
+        if showLowLevelTrace
+            label.new(bar_index, high + syminfo.mintick * 60, "Hit Strategy Close_all→ " + f_iso_local(earlyExitTime, tzInput), style = label.style_label_down, color = color.new(color.gray, 20), textcolor = color.white)
+
+        // >>> PATCH B (FINAL): §17.8 Early Exit — REPLACE ACTION BLOCK BEGIN
+        string chartTkr_e178_b3 = syminfo.ticker
+        string epProxyTicker_e178_b3 = proxyTickerPos != "" ? proxyTickerPos : f_get_proxy_ticker(chartTkr_e178_b3)
+        bool emitLabel_e178_b3 = true
+        bool doCancelAllBefore_e178_b3 = true
+
+        bool posIsLong_e178_b3 = strategy.position_size > 0
+        string thisEntryId_e178_b3 = posIsLong_e178_b3 ? idLong : idShort
+        string thisExitId_e178_b3  = posIsLong_e178_b3 ? idLong + "_Exit" : idShort + "_Exit"
+        string oppPrimId_e178_b3   = posIsLong_e178_b3 ? idShort : idLong
+        string oppPrimEx_e178_b3   = posIsLong_e178_b3 ? idShort + "_Exit" : idLong + "_Exit"
+
+        bool allowExit_e178 = na(lastExitEmitBar) or lastExitEmitBar != bar_index
+        bool allowChart_e178 = allowExit_e178
+        bool allowProxy_e178 = allowExit_e178
+
+        [didExit_e178_b7_tmp, proxySent_e178_b7_tmp] = f_exit_atomic("EarlyExit", "Early Positive Close Exit", close, time, tzInput, chartTkr_e178_b3, epProxyTicker_e178_b3, emitLabel_e178_b3, doCancelAllBefore_e178_b3, thisEntryId_e178_b3, thisExitId_e178_b3, oppPrimId_e178_b3, oppPrimEx_e178_b3, allowChart_e178, allowProxy_e178)
+
+        if didExit_e178_b7_tmp
+            lastExitEmitBar := bar_index
+        if didExit_e178_b7_tmp
+            earlyExitFired := true
+        if proxySent_e178_b7_tmp and proxyTickerPos != ""
+            proxyPosActive := false
+        if proxySent_e178_b7_tmp and proxyTickerPos != ""
+            proxyTickerPos := ""
+        if proxySent_e178_b7_tmp and proxyTickerPos != ""
+            proxyPosDir := 0
+        if proxySent_e178_b7_tmp and proxyTickerPos != ""
+            proxyPosQty := 0
+
+        oppTPLineActive := false
+        oppTPLineIsLong := false
+        oppTPLinePrice  := na
+    // >>> PATCH B (FINAL): §17.8 Early Exit — REPLACE ACTION BLOCK END
+
+
+        // >>> PATCH B (FINAL): §17.8 Early Exit — REPLACE ACTION BLOCK END
+
+        // >>> PATCH C: remove old unconditional latch — BEGIN
+        // Find this line inside §17.8 (after the label) and replace it:
+        //     earlyExitFired := true
+        // with this single line (re-uses didExit_178 from Patch B, which is in scope):
+        earlyExitFired := didExit_e178_b7_tmp ? true : earlyExitFired
+        // >>> PATCH C: remove old unconditional latch — END
+
+
+// ───────────────────────────────────────────────────────────────
+// 17.9) Extra Exit Code (clean up bad state, it happens!)
+// ───────────────────────────────────────────────────────────────
+
+// Cleanup: executes on every bar at or after exit
+if time[0] >= exitTime
+    string chartTkr_eos = syminfo.ticker
+    string proxyTkr_eos = proxyTickerPos != "" ? proxyTickerPos : f_get_proxy_ticker(chartTkr_eos)
+    bool emitLabel_eos = true
+    bool doCancelAll_eos = true
+
+    bool posIsLong_eos = strategy.position_size > 0
+    string thisEntry_eos = posIsLong_eos ? idLong : idShort
+    string thisExit_eos  = posIsLong_eos ? idLong + "_Exit" : idShort + "_Exit"
+    string oppPrim_eos   = posIsLong_eos ? idShort : idLong
+    string oppPrimEx_eos = posIsLong_eos ? idShort + "_Exit" : idLong + "_Exit"
+
+    bool allowExit_eos = na(lastExitEmitBar) or lastExitEmitBar != bar_index
+    bool allowChart_eos = allowExit_eos
+    bool allowProxy_eos = allowExit_eos
+
+    [didExit_eos_tmp, proxySent_eos_tmp] = f_exit_atomic("EOS", "End Of Session", close, time, tzInput, chartTkr_eos, proxyTkr_eos, emitLabel_eos, doCancelAll_eos, thisEntry_eos, thisExit_eos, oppPrim_eos, oppPrimEx_eos, allowChart_eos, allowProxy_eos)
+
+    if didExit_eos_tmp
+        lastExitEmitBar := bar_index
+    if proxySent_eos_tmp and proxyTickerPos != ""
+        proxyPosActive := false
+    if proxySent_eos_tmp and proxyTickerPos != ""
+        proxyTickerPos := ""
+    if proxySent_eos_tmp and proxyTickerPos != ""
+        proxyPosDir := 0
+    if proxySent_eos_tmp and proxyTickerPos != ""
+        proxyPosQty := 0
+
+    resetTimes := true
+    lastIssuedTradeNumber_reason := "session-reset"
+    lastIssuedTradeNumber := 0
+    sizingSnapTaken := false
+    sLongEntry := na
+    sShortEntry := na
+    sLongStop := na
+    sShortStop := na
+    sLongTP := na
+    sShortTP := na
+    sessionSnapTaken := false
+    sessionValidFrozen := true
+    sessionInvalidReasonFrozen := ""
+    oppTPLineActive := false
+    oppTPLineIsLong := false
+    oppTPLinePrice := na
+    scoped_officialRangeStarted := false
+    scoped_actualRangeStart := na
+    rearmAfterProfitPending := false
+    rearmEligibleFromBar := na
+
+    // >>> PATCH I: EOS — reset cycle state
+    cycleSide := 0
+    oppOutstanding := 0
+
+
+// ───────────────────────────────────────────────────────────────
+// 18) PLOTS/Data Windows (precompute series, no ternaries inside plot())
+// ───────────────────────────────────────────────────────────────
+plot(longEntry,  title="Long Entry",  style=plot.style_linebr, color=color.aqua)
+plot(shortEntry, title="Short Entry", style=plot.style_linebr, color=color.aqua)
+plot(longTP,    title="Long TP",    style=plot.style_linebr,   color=color.green)
+plot(shortTP,   title="Short TP",   style=plot.style_linebr,   color=color.green)
+
+// Opposite-side TP overlay (persists until session reset)
+// Precompute visibility
+bool drawOppLongTP = oppTPLineActive and oppTPLineIsLong
+bool drawOppShortTP = oppTPLineActive and not oppTPLineIsLong
+float pOppLongTP  = drawOppLongTP  ? oppTPLinePrice : na
+float pOppShortTP = drawOppShortTP ? oppTPLinePrice : na
+plot(pOppLongTP,  title="Opp Long TP (Opposite Taken)",  style=plot.style_linebr, color=color.new(color.green, 50))
+plot(pOppShortTP, title="Opp Short TP (Opposite Taken)", style=plot.style_linebr, color=color.new(color.green, 50))
+
+plot(longStop, style=plot.style_linebr, color=color.yellow, title="Long Stop")
+plot(shortStop, style=plot.style_linebr, color=color.orange, title="Short Stop")
+plot(tpSize / syminfo.mintick, title="TP Ticks", style=plot.style_linebr, color=color.green, display=display.data_window)
+plot(stopSize  / syminfo.mintick, title="Stop Ticks", style=plot.style_linebr, color=color.red, display=display.data_window)
+plot(longEntry - shortEntry, title="Range Size", style=plot.style_linebr, color=color.yellow, display=display.data_window)
+plot(f_calcPositionSize(longEntry, longStop), title="Position Size", style=plot.style_linebr, color=color.orange, display=display.data_window)
+plot(inBreakoutWindow ? tradeLimit : na, title="Active Trade Limit", color=color.orange, display=display.data_window)
+
+// VWAP/VWMA plotting guard
+//bool drawVW = showVWAPComponents and (inDefine or inBreakoutWindow) and realtimeEffective
+//float vwmaRaw = ta.vwma(close, vwapLen)
+//float vwapRaw = ta.vwap(hlc3)
+//float vwapFallback = na(vwapRaw) ? vwmaRaw : vwapRaw
+//float pVWMA = drawVW ? vwmaRaw : na
+//float pVWAP = drawVW ? vwapFallback : na
+//plot(pVWMA, title="Session VWMA", style=plot.style_linebr, color=color.orange)
+//plot(pVWAP, title="Session VWAP", style=plot.style_linebr, color=color.purple)
+
+
+// === Data Window display only for filters
+plot(dayHigh - dayLow, title="Range Width", color=color.blue, display=display.data_window)
+plot(minRangePoints, title="Min Allowed Range", color=color.blue, display=display.data_window)
+plot(maxRangePoints, title="Max Allowed Range", color=color.blue, display=display.data_window)
+
+// === Data Window Logging of Filter Status ===
+plot(sessionValid ? 1 : 0, title="Session Valid", color=color.gray, display=display.data_window)
+plotchar(na(sessionInvalidReason) ? na : 1, title="Session Reason Exists", char='⟶', location=location.top, display=display.data_window)
+
+// AFTER — Data Window helpers for override status/value (no chart clutter)
+plot(oppTPOverrideActive ? 1 : na, title="Opp TP Override Active", display=display.data_window)
+plot(oppTPOverrideActive ? oppositeTpOverride : na, title="Opp TP Override Value", display=display.data_window)
+// ─────────────────────────────
+// 📊 Data Window Debug Plots for Deferred Start
+// ─────────────────────────────
+plot(scoped_officialRangeStarted ? 1 : 0, title="Scoped Official Range Started", color=color.purple, display=display.data_window)
+plot(midpointStartTolerancePct > 0 ? 1 : 0, title="Deferred Start Proximity Filter Enabled", color=color.fuchsia, display=display.data_window)
+plot(midpointStartTolerancePct, title = "Midpoint Proximity Percent %", display = display.data_window, color = na)
+plot(scoped_inBreakoutWindow ? 1 : 0, title="Scoped In Breakout Window", color=color.red, display=display.data_window)
+plot(scoped_inDeferredBreakout ? 1 : 0, title="Scoped Deferred Breakout", color=color.orange, display=display.data_window)
+plot(scoped_isNearMidpoint ? 1 : 0, title="Scoped Near Midpoint", color=color.yellow, display=display.data_window)
+plot(scoped_rangeMidpoint, title="Scoped Range Midpoint", color=color.gray, display=display.data_window)
+plot(scoped_rangeWidth, title="Scoped Range Width", color=color.blue, display=display.data_window)
+plot(tradingHalted ? 1 : 0, title="Trading Halted", display=display.data_window)
+
+plot(math.abs(close - scoped_rangeMidpoint), title="Midpoint Distance", color=color.fuchsia, display=display.data_window)
+plot(scoped_rangeWidth * midpointStartTolerancePct / 100, title="Allowed Deviation", color=color.teal, display=display.data_window)
+
+bool officialStartEffectiveDW = scoped_officialRangeStarted or not na(scoped_actualRangeStart)
+plot(officialStartEffectiveDW ? 1 : 0, title="Official Start Effective", color=color.purple, display=display.data_window)
+plot(lastIssuedTradeNumber, title="Last Issued Trade #", display=display.data_window)
+
+
+// ───────────────────────────────────────────────────────────────
+// 19) SESSION INFO PANEL (lightweight; day-by-day)
+// ───────────────────────────────────────────────────────────────
+var float lastEntryPrice = na
+var bool lastWasLong = false
+var bool lastWasLongValid = false
+var int lastClosedTrades = 0
+var float plPoints = na
+var float qty = na
+
+var float debugLastEntry = na
+var bool debugLastWasLong = false
+var bool debugTradeArmed = false
+
+showSessionBox = input.bool(true, "Show Session Info Box", tooltip="Displays session stats", group="Display Settings")
+
+// Tick to point and $ conversion helpers
+f_ticksToPoints(_raw) => syminfo.mintick != 0 ? (_raw / syminfo.mintick) / 4 : _raw
+f_dollars(_pts, _qty) => _pts * 2 * math.abs(_qty)
+
+// If armed from bracket logic
+if debugTradeArmed and na(lastEntryPrice)
+    lastEntryPrice := debugLastEntry
+    lastWasLong := debugLastWasLong
+    lastWasLongValid := true
+
+// Detect trade closed
+if strategy.closedtrades > lastClosedTrades
+    lastClosedTrades := strategy.closedtrades
+    float exitPrice = strategy.closedtrades.exit_price(strategy.closedtrades - 1)
+    float entryPrice = strategy.closedtrades.entry_price(strategy.closedtrades - 1)
+    qty := strategy.closedtrades.size(strategy.closedtrades - 1)
+
+    if showPnLIndicators == "Yes" and qty != 0 and not na(entryPrice) and not na(exitPrice)
+        bool isLong = qty > 0
+        float rawPL = isLong ? (exitPrice - entryPrice) : (entryPrice - exitPrice)
+        plPoints := f_ticksToPoints(rawPL)
+        float dollarPL = f_dollars(plPoints, qty)
+
+        string labelText = "P/L: " + str.tostring(plPoints, "#.##") + " pts, $" + str.tostring(dollarPL, "#.##") + " [" + (isLong ? "Long" : "Short") + "]"
+        bool isProfit = plPoints > 0
+        color labelColor = isProfit ? color.green : color.red
+        //float yOffset = syminfo.mintick * 75
+        //bool placeAbove = (isLong and isProfit) or (not isLong and not isProfit)
+        //float yPos = placeAbove ?  (high + yOffset) : (low - yOffset)
+        //labelStyle = placeAbove ? label.style_label_down : label.style_label_up
+        // Place profits above the bar, losses below (prevents overlap on same bar)
+        float yOffsetProfit = syminfo.mintick * 90
+        float yOffsetLoss   = syminfo.mintick * 90
+        bool  placeAbove    = isProfit
+        float yPos          = isProfit ? (high + yOffsetProfit) : (low - yOffsetLoss)
+        labelStyle          = isProfit ? label.style_label_down : label.style_label_up        
+        // If the prior bar also had a profit label, bump this one higher to avoid overlap
+        int _bumpSteps = isProfit and not na(lastProfitLblBar) and bar_index == lastProfitLblBar + 1 ? 1 : 0
+        float _bump = syminfo.mintick * 60 * _bumpSteps
+        yPos := isProfit ? (yPos + _bump) : yPos
+        label.new(bar_index, yPos, labelText, style=labelStyle, color=labelColor, textcolor=color.white, size=size.small)
+
+        // Track last profit bar index
+        if isProfit
+            lastProfitLblBar := bar_index
+
+    lastEntryPrice := na
+    lastWasLongValid := false
+    debugTradeArmed := false
+
+plot(plPoints, title="PL Points", display=display.data_window, color=color.green)
+plot(qty, title="Last Trade Qty", display=display.data_window, color=color.orange)
+plot((not na(rangeStart) and not na(exitTime) and time >= rangeStart and time <= exitTime) ? f_calcSessionPL(rangeStart, exitTime) : na, title="Session PnL ($)", color=color.fuchsia, display=display.data_window)
+
+f_getPLTextColor(_pl) => _pl > 0 ? color.green : _pl < 0 ? color.red : color.white
+
+// 🛡️ Snapshot only when trades are present and during session window
+if time >= rangeStart and time <= exitTime and tradesToday > 0
+    sessionPL_snapshot := f_calcSessionPL(rangeStart, exitTime)
+    tradesToday_snapshot := tradesToday
+    snapshotRangeStart := rangeStart //added because of prior day bleed over bug
+
+// ───────────────────────────────────────────────────────────────
+// 20) Trade and Session Cleanup
+// ───────────────────────────────────────────────────────────────
+
+var bool didSessionEnd = false
+// Single-line label showing the boolean as text
+//label.new(bar_index, high + syminfo.mintick*20, didSessionEnd ? "true" : "false", style=label.style_label_down, color=color.teal, textcolor=color.white)
+
+dayOfWeekNow = dayofweek(time)
+
+if bar_index > 0 and time[1] < exitTime and time >= exitTime and not didSessionEnd and not earlyExitFired and dayOfWeekNow != dayofweek.sunday
+    if showDebugLabels
+        label.new(bar_index, high + 40, "Exit Alert Fired", style = label.style_label_down, color = color.fuchsia, textcolor = color.white)
+
+    string chartTkr_eoa = syminfo.ticker
+    string proxyTkr_eoa = proxyTickerPos != "" ? proxyTickerPos : f_get_proxy_ticker(chartTkr_eoa)
+    bool emitLabel_eoa = true
+    bool doCancelAll_eoa = true
+
+    bool posIsLong_eoa = strategy.position_size > 0
+    string thisEntry_eoa = posIsLong_eoa ? idLong : idShort
+    string thisExit_eoa  = posIsLong_eoa ? idLong + "_Exit" : idShort + "_Exit"
+    string oppPrim_eoa   = posIsLong_eoa ? idShort : idLong
+    string oppPrimEx_eoa = posIsLong_eoa ? idShort + "_Exit" : idLong + "_Exit"
+
+    bool allowExit_eoa = na(lastExitEmitBar) or lastExitEmitBar != bar_index
+    bool allowChart_eoa = allowExit_eoa
+    bool allowProxy_eoa = allowExit_eoa
+
+    [didExit_eoa_tmp, proxySent_eoa_tmp] = f_exit_atomic("EOS Window", "Exit Alert Fired", close, time, tzInput, chartTkr_eoa, proxyTkr_eoa, emitLabel_eoa, doCancelAll_eoa, thisEntry_eoa, thisExit_eoa, oppPrim_eoa, oppPrimEx_eoa, allowChart_eoa, allowProxy_eoa)
+
+    if didExit_eoa_tmp
+        lastExitEmitBar := bar_index
+    if proxySent_eoa_tmp and proxyTickerPos != ""
+        proxyPosActive := false
+    if proxySent_eoa_tmp and proxyTickerPos != ""
+        proxyTickerPos := ""
+    if proxySent_eoa_tmp and proxyTickerPos != ""
+        proxyPosDir := 0
+    if proxySent_eoa_tmp and proxyTickerPos != ""
+        proxyPosQty := 0
+
+    didSessionEnd := true
+
+
+if didSessionEnd and bar_index > 0
+    tradesToday := 0
+    placedTrades := false
+    closedTrades := strategy.closedtrades
+    waitUntilBar := na
+    resetTimes := true
+    didSessionEnd := false
+    sessionBlocked :=false
+    issuedLongOrder  := false
+    issuedShortOrder := false
+    lastIssuedTradeNumber_reason := "session-reset"
+    lastIssuedTradeNumber := 0 
+    // 🔄 Reset info box state
+    sessionPL_snapshot := na
+    tradesToday_snapshot := na
+    sessionTable := na
+    rearmAfterProfitPending := false
+    rearmEligibleFromBar := na
+    tradingHalted := false
+    // >>> PATCH J: alert-session-end — reset cycle state
+    cycleSide := 0
+    oppOutstanding := 0
+
+// Clear stale snapshot if it belongs to a prior session - added due to prior day bleed over bug
+if not na(sessionPL_snapshot) and not na(snapshotRangeStart) and snapshotRangeStart != rangeStart
+    sessionPL_snapshot := na
+    tradesToday_snapshot := na
+    sessionTable := na
+
+if showSessionBox and not na(sessionPL_snapshot)
+    table.delete(sessionTable[1])
+    sessionTable := table.new(position=position.top_right, columns=2, rows=6, bgcolor=color.new(color.blue, 90), border_width=1, border_color=color.blue)
+
+    //label for display box to last completed to live session
+    var string lastSessionLabel = na
+    var int lastTradeLimitSnapshot = na
+    if bar_index > 0 and time[1] < rangeStart and time >= rangeStart
+        lastSessionLabel := rangeSetSnapshot
+        lastTradeLimitSnapshot := tradeLimit
+    bool isLiveSession = realtimeEffective and time >= rangeStart and time <= exitTime
+
+
+    table.cell(sessionTable, 0, 0, text="Max Sets", bgcolor=color.navy, text_color=color.white)
+    table.cell(sessionTable, 1, 0, text=((not na(lastTradeLimitSnapshot) ? lastTradeLimitSnapshot : tradeLimit) <= 0 ? "∞" : str.tostring(not na(lastTradeLimitSnapshot) ? lastTradeLimitSnapshot : tradeLimit)), bgcolor=color.navy, text_color=color.white)
+
+    table.cell(sessionTable, 0, 1, text="Sets Placed", bgcolor=color.navy, text_color=color.white)
+    table.cell(sessionTable, 1, 1, text=str.tostring(not na(lastIssuedTradeNumber) ? lastIssuedTradeNumber : 0), bgcolor=color.navy, text_color=color.white)
+
+    table.cell(sessionTable, 0, 2, text="Orders (closes) Today", bgcolor=color.navy, text_color=color.white)
+    table.cell(sessionTable, 1, 2, text=str.tostring(tradesToday_snapshot), bgcolor=color.navy, text_color=color.white)
+
+    table.cell(sessionTable, 0, 3, text="Session Risk", bgcolor=color.navy, text_color=color.white)
+    table.cell(sessionTable, 1, 3, text="$" + str.tostring(riskDollars, "#.##"), bgcolor=color.navy, text_color=color.white)
+
+    table.cell(sessionTable, 0, 4, text="Session PnL", bgcolor=color.navy, text_color=color.white)
+    table.cell(sessionTable, 1, 4, text="$" + str.tostring(sessionPL_snapshot, "#.##"), bgcolor=color.navy, text_color=f_getPLTextColor(sessionPL_snapshot))
+
+    table.cell(sessionTable, 0, 5, text="Day PnL", bgcolor=color.navy, text_color=color.white)
+    table.cell(sessionTable, 1, 5, text="$" + str.tostring(dayPL, "#.##"), bgcolor=color.navy, text_color=f_getPLTextColor(dayPL))
+
+
+// ───────────────────────────────────────────────────────────────
+// 21) STRATEGY-CONFIRMED ENTRY & EXIT ALERTS (with full JSON)
+// ───────────────────────────────────────────────────────────────
+
+// ───────────────────────
+// Exit Alerts (after strategy exit)
+// ───────────────────────
+// Exit Alerts (after strategy exit)
+if strategy.closedtrades > strategy.closedtrades[1] and (na(lastExitEmitBar) or lastExitEmitBar != bar_index)
+    float exitPrice  = strategy.closedtrades.exit_price(strategy.closedtrades - 1)
+    float entryPrice = strategy.closedtrades.entry_price(strategy.closedtrades - 1)
+    float tradeSize  = strategy.closedtrades.size(strategy.closedtrades - 1)
+    bool  wasLong    = tradeSize > 0
+    bool  isStop     = wasLong ? (exitPrice <= entryPrice) : (exitPrice >= entryPrice)
+    bool  suppress   = isStop and not inEarlyWindow
+    if suppress
+        exitPrice := exitPrice
+    else
+        // STATS-ONLY: keep observability without emitting another exit
+        log.info("StrategyConfirmed Stats — entry=" + str.tostring(entryPrice) + " exit=" + str.tostring(exitPrice) + " size=" + str.tostring(tradeSize))
+
+// Debug Plots (Line ~900)
+plot(issuedLongOrder ? 1 : 0, title="Debug: Issued Long Order", color=color.blue, display=display.data_window)
+plot(issuedShortOrder ? 1 : 0, title="Debug: Issued Short Order", color=color.red, display=display.data_window)
+plotshape(time >= exitTime and (issuedLongOrder or issuedShortOrder) and not didSessionEnd and barstate.islastconfirmedhistory
+     ? true : false,
+     title="EOS Debug", location=location.abovebar,
+     style=shape.labeldown, text="EOS")
+
+
+// === TRACE EMIT (fires only when value changes and debug enabled) ===
+if showLowLevelTrace
+    bool _changed = lastIssuedTradeNumber != lastIssuedTradeNumber_prev
+    if _changed
+        label.new(
+             x=bar_index,
+             y=high + syminfo.mintick * 80,
+             text="LITN  " + str.tostring(lastIssuedTradeNumber_prev) + " → " + str.tostring(lastIssuedTradeNumber) + " via " + (lastIssuedTradeNumber_reason == "" ? "unknown" : lastIssuedTradeNumber_reason),
+             style=label.style_label_down,
+             color=color.new(color.fuchsia, 0),
+             textcolor=color.white)
+        lastIssuedTradeNumber_prev := lastIssuedTradeNumber
+        lastIssuedTradeNumber_reason := ""
+
+//if bar_index == 20253
+//    label.new(bar_index, high, "bar 26165 " + f_iso_local(time, tzInput), style=label.style_label_down, color=color.yellow, textcolor=color.black)
+
