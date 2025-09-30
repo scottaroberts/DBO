@@ -159,28 +159,28 @@ Q3 --> Q4[When none remain → Rearm]
 
 ```mermaid
 graph LR
-  subgraph Inputs_and_State
-    A1[Session validity]
-    A2[Filters: VWAP/EMA/RSI/Range]
-    A3[MidReturn latch (post-profit)]
-    A4[Context: Entry / Reissue / OppAdd]
-    A5[Scope toggles per gate]
-    A6[Day PnL (net) & Daily Halts]
+  subgraph Inputs_and_State["Inputs and State"]
+    A1["Session validity"]
+    A2["Filters: VWAP / EMA / RSI / Range"]
+    A3["MidReturn latch (post-profit)"]
+    A4["Context: Entry / Reissue / OppAdd"]
+    A5["Scope toggles per gate"]
+    A6["Day PnL (net) & Daily Halts"]
   end
 
-  A1 --> B{Base preconditions}
+  A1 --> B{"Base preconditions"}
   A2 --> B
   A3 --> B
   A4 --> B
   A5 --> B
   A6 --> B
 
-  B -->|Fail| Z[BLOCK]
-  B -->|Pass| C[gates_for(context)]
+  B -->|Fail| Z["BLOCK"]
+  B -->|Pass| C["gates_for(context)"]
 
-  C --> D{All enabled pass AND not tradingHalted}
+  C --> D{"All enabled pass AND not tradingHalted"}
   D -->|No| Z
-  D -->|Yes| E[ALLOW]
+  D -->|Yes| E["ALLOW"]
 ```
 
 **Notes**
