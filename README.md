@@ -1,6 +1,10 @@
-# DBO_Prod (Range Breakout + Recoup Add) — Business Rules & Feature Inventory
+# DBO_Prod (Range Breakout + Recoup Add) — Business Rules, Stateflows, Feature Inventory
 
-This repo contains the **current TradingView strategy** used for the DBO bot (“DBO_Prod”). The focus of this README is **business rules** (what the system does and why), plus a **feature inventory** you can use to plan a migration to a new platform.
+This repo contains the **current TradingView strategy** used for the DBO bot (“DBO_Prod”). This README prioritizes:
+
+- **Business rules** (what the system does and why)
+- **Stateflows** (how it behaves across fills/exits)
+- **Feature inventory** (so you can build a migration roadmap to a new platform)
 
 ---
 
@@ -22,7 +26,7 @@ This repo contains the **current TradingView strategy** used for the DBO bot (�
 - **Breakout window:** the period after the range ends where trading is allowed (until `exitTime`).
 - **Bracket set:** a pair of pending orders (Long + Short) with attached TP/SL.
 - **Cycle:** a full sequence from “brackets armed” → (fill) → (profit/stop) → (rearm or stand-down).
-- **Recoup (Opposite Add):** an additional opposite-direction trade intended to recover loss / stabilize outcomes.
+- **Recoup / Opposite Add:** an additional opposite-direction trade intended to recover loss / stabilize outcomes.
 - **Proxy ticker:** when enabled, Recoup orders/exits are emitted as alerts for a different symbol (typically **YM**).
 
 ---
@@ -35,9 +39,10 @@ This repo contains the **current TradingView strategy** used for the DBO bot (�
 
 ### Session construction (single daily session)
 Inputs:
-- **Range End**: `rangeEndHour`, `rangeEndMin` (default ~03:34 in `tzInput`)
-- **Lookback**: `lookbackH`, `lookbackM` (default 4:00)
-- **Exit Duration**: `exitDurH`, `exitDurM` (default 9:35)
+- **Range End**: `rangeEndHour`, `rangeEndMin`
+- **Lookback**: `lookbackH`, `lookbackM`
+- **Exit Duration**: `exitDurH`, `exitDurM`
+- **Early Exit Minutes**: `earlyExitMinutes`
 
 Business rule:
 - `rangeEnd` is today’s “Range End” timestamp in `tzInput` (DST-safe).
@@ -112,7 +117,7 @@ For each TypeId, a dropdown selects one policy:
 - `useSev3TimeWindow = true` enables **Intraday Delay Mode**.
 - In this mode, the bot:
   - Blocks the day **only** if there is at least one “Block entire day” event **or**
-  - Blocks **until** the latest “timed” event today plus `sev3PostDelayMin`.
+  - Blocks **until** the latest “timed” event today plus the configured post-delay minutes.
 
 Important detail:
 - Timed events require a valid HHMM (> 0). Rows with `HHMM = 0000` only matter if their policy is **Block entire day**.
@@ -120,7 +125,7 @@ Important detail:
 ### How this affects trading
 - When news is blocking:
   - New bracket placements are prevented.
-  - “Halt” state is shown in telemetry.
+  - “Halt / Block” state is shown in telemetry.
 - When the last timed event + delay passes, trading can resume **within the same session** (if other gates allow).
 
 ---
@@ -140,9 +145,6 @@ PnL computation:
   - `dollars = points × syminfo.pointvalue × |qty|`
   - `net = dollars − strategy.closedtrades.commission(i)`
 
-Note:
-- If you configure commissions/slippage in the strategy settings UI, those values will be reflected via TradingView’s closed-trade prices and `commission(i)`.
-
 ### Trade limit
 - `tradeLimit` counts **sets** (Long+Short bracket placements), not individual fills.
 - The bot will not arm a new set once `lastIssuedTradeNumber >= tradeLimit`.
@@ -151,30 +153,110 @@ Note:
 After the first bracket set has been issued:
 - The bot requires price to return **inside the range** before it will place the next set.
 
-### Midpoint quality after Trade 1
-If `requireMidpointReturn = true`:
-- After the first completed trade, re-arming can require a midpoint “return” confirmation (bar close near midpoint), depending on context.
-
 ---
 
-## Bracket cycle & stateflows (business logic)
+## Bracket cycle & stateflows (flow charts)
 
-### Placement
-When all entry preconditions pass (session valid, not blocked, not halted, no open position, locks clear, tradeLimit ok):
-- Place **both** `Long` and `Short` brackets as a set.
+These charts are included because they remain a good, implementation-agnostic representation of “what should happen.”
 
-### On profit (TP hit)
-- Perform centralized “profit cleanup”:
-  - Cancel remaining bracket inventory (opposite side + Recoup).
-  - Reset cycle state.
-  - Optionally **re-arm** (immediately or deferred until midpoint gate passes).
-- Schedule a **one-bar-later “Emergency” sweep** to reduce the odds of a broker / webhook desync.
+### High-level state machine
 
-### On stop (SL hit)
-- **Keep the opposite side** resident (so it can still enter).
-- Clear only the side that stopped out.
-- If the opposite later stops as well, the bot re-arms a new set.
-- Special case: inside the Early Exit window, on stop the bot cancels everything and stands down (no “flip” risk near the end).
+```mermaid
+stateDiagram-v2
+    direction LR
+
+    [*] --> IDLE
+
+    IDLE --> ARMED: Session valid\nPlace bracket set (Long + Short)
+
+    ARMED --> LONG_ACTIVE: Long entry fills
+    ARMED --> SHORT_ACTIVE: Short entry fills
+    ARMED --> IDLE: Block/Halt/EOS\nCancel inventory
+
+    state LONG_ACTIVE {
+        [*] --> LIVE_L
+        LIVE_L --> OPP_ADD_PENDING_L: (Optional) schedule OppAdd SHORT\n(next bar)
+        OPP_ADD_PENDING_L --> LIVE_L: OppAdd placed\n(keep original Short bracket too)
+
+        LIVE_L --> PROFIT_L: Long TP
+        LIVE_L --> STOP_L: Long SL
+
+        PROFIT_L --> CLEANUP_PROFIT_L: Cancel remaining orders\nReset cycle
+        CLEANUP_PROFIT_L --> REARM_L: Rearm allowed
+
+        STOP_L --> WAIT_OPP_L: Keep opposite inventory\n(original Short + optional OppAdd)
+        WAIT_OPP_L --> SHORT_ACTIVE: Opposite short fills
+        WAIT_OPP_L --> REARM_L: No opposite inventory remains
+    }
+
+    state SHORT_ACTIVE {
+        [*] --> LIVE_S
+        LIVE_S --> OPP_ADD_PENDING_S: (Optional) schedule OppAdd LONG\n(next bar)
+        OPP_ADD_PENDING_S --> LIVE_S: OppAdd placed\n(keep original Long bracket too)
+
+        LIVE_S --> PROFIT_S: Short TP
+        LIVE_S --> STOP_S: Short SL
+
+        PROFIT_S --> CLEANUP_PROFIT_S: Cancel remaining orders\nReset cycle
+        CLEANUP_PROFIT_S --> REARM_S: Rearm allowed
+
+        STOP_S --> WAIT_OPP_S: Keep opposite inventory\n(original Long + optional OppAdd)
+        WAIT_OPP_S --> LONG_ACTIVE: Opposite long fills
+        WAIT_OPP_S --> REARM_S: No opposite inventory remains
+    }
+
+    REARM_L --> ARMED
+    REARM_S --> ARMED
+```
+
+### PROFIT vs STOP cleanup — decision tree
+
+```mermaid
+graph TB
+S[Initial entry closes] --> T{Exit type}
+T -->|PROFIT or Early| P1[Cancel primaries]
+P1 --> P2[Cancel OppAdd]
+P2 --> P3[Cancel original opposite]
+P3 --> P4[Reset OppAdd tracking]
+P4 --> P5[Rearm via reissue gates]
+
+T -->|STOP| Q1[Cancel only stopped side]
+Q1 --> Q2[Keep original opposite + OppAdd]
+Q2 --> Q3[Await opposite fills 0..2]
+Q3 --> Q4[When none remain → Rearm]
+```
+
+### Modular gate manager — concept
+
+```mermaid
+graph LR
+  subgraph Inputs_and_State["Inputs and State"]
+    A1["Session validity"]
+    A2["Filters: VWAP / EMA / RSI / Range"]
+    A3["MidReturn latch (post-profit)"]
+    A4["Context: Entry / Reissue / OppAdd"]
+    A5["Scope toggles per gate"]
+    A6["Day PnL (net) & Daily Halts"]
+  end
+
+  A1 --> B{"Base preconditions"}
+  A2 --> B
+  A3 --> B
+  A4 --> B
+  A5 --> B
+  A6 --> B
+
+  B -->|Fail| Z["BLOCK"]
+  B -->|Pass| C["gates_for(context)"]
+
+  C --> D{"All enabled pass AND not tradingHalted"}
+  D -->|No| Z
+  D -->|Yes| E["ALLOW"]
+```
+
+**Exit invariants (apply everywhere):**
+- **Order of operations:** cancel → close → emit alerts.
+- “Emergency sweep” behavior may re-emit exit/cancel logic on a later bar to reduce webhook/broker desync risk.
 
 ---
 
@@ -184,13 +266,12 @@ When all entry preconditions pass (session valid, not blocked, not halted, no op
 - When a micro position opens (Long or Short), the bot evaluates a Recoup add in the **opposite direction**.
 
 ### Entry/TP logic
-- Recoup entry is offset from the stopped side’s stop level by `oppositeReissueEntryOffsetPts`.
-  - If this input is **-1**, the bot uses a “legacy match” offset (`entryOff − stopOff`).
+- Recoup entry is offset by `oppositeReissueEntryOffsetPts`.
+  - If this input is **-1**, the bot uses the legacy match offset (entryOff − stopOff).
 - Recoup TP can be overridden with `oppositeTpOverride` (if set ≥ 0).
 
 ### Stop distance scaling (Recoup only)
-- `oppAddStopPct` scales the Recoup stop distance vs the original micro bracket distance.
-  - Example: 80% means the Recoup stop is closer than the original stop distance.
+- `oppAddStopPct` scales the Recoup stop distance vs the original bracket distance (percent).
 
 ### Sizing (risk-delta targeting)
 - The bot targets a Recoup that increases total risk toward:
@@ -198,12 +279,12 @@ When all entry preconditions pass (session valid, not blocked, not halted, no op
 - It computes the **additional** quantity needed (“risk delta”) rather than mirroring the micro size.
 
 ### Proxy routing (YM)
-If `useProxyRealtimeOnly = true` and the script is running in realtime:
+If proxy routing is enabled (typical setup):
 - Recoup orders are emitted as proxy alerts for the YM ticker (derived from the chart symbol).
 - Quantity conversion uses `proxyQtyMul` (default ~0.10, i.e., YM ≈ 10× MYM).
 
 Backtesting behavior:
-- In historical bars (non-realtime), Recoup trades are simulated on the chart symbol so Strategy Tester can model the logic.
+- In historical bars, the strategy simulates Recoup logic on the chart symbol so the Strategy Tester can model the logic.
 
 ### Paired exit on Recoup TP
 If the Recoup TP level is touched:
@@ -228,22 +309,19 @@ Key visuals you’ll see on-chart:
 - **Range box** during formation.
 - **Deferred-start red box** if midpoint gating delays the official start.
 - **Active (yellow) box** during the trading window.
-- Optional debug labels:
-  - L1: trade labels
-  - L2: opposite side / news labels
-  - L3: low-level trace
 
-Data-window / panel concepts:
-- Trading status (Trading vs Blocked)
-- Next block / resume time (when intraday delay mode is on)
+Common telemetry fields (table / data-window):
+- Trading status (Trading vs Blocked) + reason
+- Next block / resume time (intraday delay mode)
 - Day P/L and halt reason
+- Trade count / trade-limit state
 
 ---
 
 ## Feature inventory (for migration roadmap)
 
 ### Session & time handling
-- [x] DST-safe time anchors via `timestamp(tz, ...)`
+- [x] DST-safe time anchors
 - [x] Range window built from RangeEnd + Lookback duration
 - [x] Breakout window built from RangeEnd + ExitDuration
 - [x] Daily reset boundary at 15:00 local
@@ -252,14 +330,14 @@ Data-window / panel concepts:
 - [x] Dual bracket placement (Long + Short)
 - [x] Trade-limit by “sets”
 - [x] Price-inside-range gate before re-arming
-- [x] Midpoint deferred-start & post-Trade1 quality gate
+- [x] Midpoint deferred-start gate
 - [x] Min/Max range width filters
 - [x] Cooldowns / per-bar de-dupe latches
 
 ### Recoup / Opposite Add
-- [x] Immediate opposite-direction add on entry
+- [x] Opposite-direction add on entry (optional)
 - [x] Risk-delta sizing to a multiplier target
-- [x] Stop distance scaling (percent of original)
+- [x] Stop distance scaling (% of original)
 - [x] Opposite TP override
 - [x] Paired exit when Recoup TP is hit
 
@@ -309,8 +387,8 @@ Data-window / panel concepts:
 
 ## Repo notes
 
-- Script name: **DBO_Prod** (Pine v6).
-- External dependency: **`adam_overton/TradersPostDeluxe`** TradingView library for advanced order JSON/alerts.
+- Script: **DBO_Prod** (TradingView Pine).
+- External dependency: TradingView library **`adam_overton/TradersPostDeluxe`** for advanced order JSON/alerts.
 
 ---
 
