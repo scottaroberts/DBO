@@ -157,7 +157,7 @@ After the first bracket set has been issued:
 
 ## Bracket cycle & stateflows (flow charts)
 
-These charts are included because they remain a good, implementation-agnostic representation of “what should happen.”
+These charts are included because they are an implementation-agnostic representation of “what should happen.”
 
 ### High-level state machine
 
@@ -198,7 +198,7 @@ Reset cycle
     WAIT_OPP --> LONG_LIVE: Opposite long fills
     WAIT_OPP --> SHORT_LIVE: Opposite short fills
     WAIT_OPP --> REARM: Inventory cleared
-Re-arm permitted
+rearm permitted
 
     LONG_EARLY_EXIT --> CLEANUP_EXIT: Cancel + flatten
 Stand down
