@@ -167,46 +167,51 @@ stateDiagram-v2
 
     [*] --> IDLE
 
-    IDLE --> ARMED: Session valid\nPlace bracket set (Long + Short)
+    IDLE --> ARMED: Session valid
+Place bracket set (Long + Short)
 
-    ARMED --> LONG_ACTIVE: Long entry fills
-    ARMED --> SHORT_ACTIVE: Short entry fills
-    ARMED --> IDLE: Block/Halt/EOS\nCancel inventory
+    ARMED --> LONG_LIVE: Long fills
+    ARMED --> SHORT_LIVE: Short fills
+    ARMED --> IDLE: Block/Halt/EOS
+Cancel inventory
 
-    state LONG_ACTIVE {
-        [*] --> LIVE_L
-        LIVE_L --> OPP_ADD_PENDING_L: (Optional) schedule OppAdd SHORT\n(next bar)
-        OPP_ADD_PENDING_L --> LIVE_L: OppAdd placed\n(keep original Short bracket too)
+    LONG_LIVE --> LONG_PROFIT: Long TP
+    LONG_LIVE --> LONG_STOP: Long SL
+    LONG_LIVE --> LONG_EARLY_EXIT: Early Exit (profit-only)
+    LONG_LIVE --> EOS: End of Session
 
-        LIVE_L --> PROFIT_L: Long TP
-        LIVE_L --> STOP_L: Long SL
+    SHORT_LIVE --> SHORT_PROFIT: Short TP
+    SHORT_LIVE --> SHORT_STOP: Short SL
+    SHORT_LIVE --> SHORT_EARLY_EXIT: Early Exit (profit-only)
+    SHORT_LIVE --> EOS: End of Session
 
-        PROFIT_L --> CLEANUP_PROFIT_L: Cancel remaining orders\nReset cycle
-        CLEANUP_PROFIT_L --> REARM_L: Rearm allowed
+    LONG_PROFIT --> CLEANUP_PROFIT: Cancel opposite + Recoup
+Reset cycle
+    SHORT_PROFIT --> CLEANUP_PROFIT: Cancel opposite + Recoup
+Reset cycle
 
-        STOP_L --> WAIT_OPP_L: Keep opposite inventory\n(original Short + optional OppAdd)
-        WAIT_OPP_L --> SHORT_ACTIVE: Opposite short fills
-        WAIT_OPP_L --> REARM_L: No opposite inventory remains
-    }
+    LONG_STOP --> WAIT_OPP: Keep opposite inventory
+(Short bracket + optional Recoup)
+    SHORT_STOP --> WAIT_OPP: Keep opposite inventory
+(Long bracket + optional Recoup)
 
-    state SHORT_ACTIVE {
-        [*] --> LIVE_S
-        LIVE_S --> OPP_ADD_PENDING_S: (Optional) schedule OppAdd LONG\n(next bar)
-        OPP_ADD_PENDING_S --> LIVE_S: OppAdd placed\n(keep original Long bracket too)
+    WAIT_OPP --> LONG_LIVE: Opposite long fills
+    WAIT_OPP --> SHORT_LIVE: Opposite short fills
+    WAIT_OPP --> REARM: Inventory cleared
+Re-arm permitted
 
-        LIVE_S --> PROFIT_S: Short TP
-        LIVE_S --> STOP_S: Short SL
+    LONG_EARLY_EXIT --> CLEANUP_EXIT: Cancel + flatten
+Stand down
+    SHORT_EARLY_EXIT --> CLEANUP_EXIT: Cancel + flatten
+Stand down
 
-        PROFIT_S --> CLEANUP_PROFIT_S: Cancel remaining orders\nReset cycle
-        CLEANUP_PROFIT_S --> REARM_S: Rearm allowed
+    EOS --> CLEANUP_EXIT: Cancel + flatten
+Stand down
 
-        STOP_S --> WAIT_OPP_S: Keep opposite inventory\n(original Long + optional OppAdd)
-        WAIT_OPP_S --> LONG_ACTIVE: Opposite long fills
-        WAIT_OPP_S --> REARM_S: No opposite inventory remains
-    }
+    CLEANUP_PROFIT --> REARM: Rearm allowed
+    REARM --> ARMED: If rearm gates pass
+    CLEANUP_EXIT --> IDLE
 
-    REARM_L --> ARMED
-    REARM_S --> ARMED
 ```
 
 ### PROFIT vs STOP cleanup — decision tree
