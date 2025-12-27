@@ -6,7 +6,6 @@ This repo contains the **current TradingView strategy** used for the DBO bot (�
 - **Stateflows** (how it behaves across fills/exits)
 - **Feature inventory** (so you can build a migration roadmap to a new platform)
 
-
 ---
 
 ## What the bot does (1‑minute mental model)
@@ -173,33 +172,33 @@ flowchart LR
     CLEANUP_EXIT([CLEANUP_EXIT])
     REARM([REARM])
 
-    IDLE -->|Session valid / place bracket set| ARMED
+    IDLE -->|Session valid; place bracket set| ARMED
     ARMED -->|Long fills| LONG_LIVE
     ARMED -->|Short fills| SHORT_LIVE
     ARMED -->|Block / Halt / Cancel inventory| IDLE
 
-    LONG_LIVE -->|Long TP / cancel opposite + recoup| CLEANUP_PROFIT
-    SHORT_LIVE -->|Short TP / cancel opposite + recoup| CLEANUP_PROFIT
+    LONG_LIVE -->|Long TP; cancel opposite and recoup| CLEANUP_PROFIT
+    SHORT_LIVE -->|Short TP; cancel opposite and recoup| CLEANUP_PROFIT
 
-    LONG_LIVE -->|Long SL / keep opposite inventory| WAIT_OPP
-    SHORT_LIVE -->|Short SL / keep opposite inventory| WAIT_OPP
+    LONG_LIVE -->|Long SL; keep opposite inventory| WAIT_OPP
+    SHORT_LIVE -->|Short SL; keep opposite inventory| WAIT_OPP
 
     WAIT_OPP -->|Opp long fills| LONG_LIVE
     WAIT_OPP -->|Opp short fills| SHORT_LIVE
-    WAIT_OPP -->|Inventory cleared / rearm permitted| REARM
+    WAIT_OPP -->|Inventory cleared; rearm permitted| REARM
 
-    LONG_LIVE -.->|Optional / issue OppAdd SHORT| SHORT_LIVE
-    SHORT_LIVE -.->|Optional / issue OppAdd LONG| LONG_LIVE
+    LONG_LIVE -.->|Optional; issue OppAdd SHORT| SHORT_LIVE
+    SHORT_LIVE -.->|Optional; issue OppAdd LONG| LONG_LIVE
 
     ARMED -->|EOS| CLEANUP_EXIT
     LONG_LIVE -->|EOS| CLEANUP_EXIT
     SHORT_LIVE -->|EOS| CLEANUP_EXIT
-    LONG_LIVE -->|Early Exit (profit-only)| CLEANUP_EXIT
-    SHORT_LIVE -->|Early Exit (profit-only)| CLEANUP_EXIT
+    LONG_LIVE -->|Early Exit profit only| CLEANUP_EXIT
+    SHORT_LIVE -->|Early Exit profit only| CLEANUP_EXIT
 
     CLEANUP_PROFIT -->|Rearm allowed| REARM
     REARM -->|If rearm gates pass| ARMED
-    CLEANUP_EXIT -->|Cancel + flatten / stand down| IDLE
+    CLEANUP_EXIT -->|Cancel and flatten; stand down| IDLE
 
 ```
 
@@ -389,3 +388,5 @@ Common telemetry fields (table / data-window):
 ## Disclaimer
 
 This strategy is provided “as-is” for research/automation. Futures trading is risky; use strict risk controls and validate behavior in a paper environment before live deployment.
+
+
