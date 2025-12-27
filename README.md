@@ -6,6 +6,7 @@ This repo contains the **current TradingView strategy** used for the DBO bot (�
 - **Stateflows** (how it behaves across fills/exits)
 - **Feature inventory** (so you can build a migration roadmap to a new platform)
 
+
 ---
 
 ## What the bot does (1‑minute mental model)
@@ -157,60 +158,48 @@ After the first bracket set has been issued:
 
 ## Bracket cycle & stateflows (flow charts)
 
-These charts are included because they are an implementation-agnostic representation of “what should happen.”
+These charts are included because they remain a good, implementation-agnostic representation of “what should happen.”
 
 ### High-level state machine
 
 ```mermaid
-stateDiagram-v2
-    direction LR
+flowchart LR
+    IDLE([IDLE])
+    ARMED([ARMED])
+    LONG_LIVE([LONG_LIVE])
+    SHORT_LIVE([SHORT_LIVE])
+    WAIT_OPP([WAIT_OPP])
+    CLEANUP_PROFIT([CLEANUP_PROFIT])
+    CLEANUP_EXIT([CLEANUP_EXIT])
+    REARM([REARM])
 
-    [*] --> IDLE
+    IDLE -->|Session valid / place bracket set| ARMED
+    ARMED -->|Long fills| LONG_LIVE
+    ARMED -->|Short fills| SHORT_LIVE
+    ARMED -->|Block / Halt / Cancel inventory| IDLE
 
-    IDLE --> ARMED: Session valid
-Place bracket set (Long + Short)
+    LONG_LIVE -->|Long TP / cancel opposite + recoup| CLEANUP_PROFIT
+    SHORT_LIVE -->|Short TP / cancel opposite + recoup| CLEANUP_PROFIT
 
-    ARMED --> LONG_LIVE: Long fills
-    ARMED --> SHORT_LIVE: Short fills
-    ARMED --> IDLE: Block/Halt/EOS
-Cancel inventory
+    LONG_LIVE -->|Long SL / keep opposite inventory| WAIT_OPP
+    SHORT_LIVE -->|Short SL / keep opposite inventory| WAIT_OPP
 
-    LONG_LIVE --> LONG_PROFIT: Long TP
-    LONG_LIVE --> LONG_STOP: Long SL
-    LONG_LIVE --> LONG_EARLY_EXIT: Early Exit (profit-only)
-    LONG_LIVE --> EOS: End of Session
+    WAIT_OPP -->|Opp long fills| LONG_LIVE
+    WAIT_OPP -->|Opp short fills| SHORT_LIVE
+    WAIT_OPP -->|Inventory cleared / rearm permitted| REARM
 
-    SHORT_LIVE --> SHORT_PROFIT: Short TP
-    SHORT_LIVE --> SHORT_STOP: Short SL
-    SHORT_LIVE --> SHORT_EARLY_EXIT: Early Exit (profit-only)
-    SHORT_LIVE --> EOS: End of Session
+    LONG_LIVE -.->|Optional / issue OppAdd SHORT| SHORT_LIVE
+    SHORT_LIVE -.->|Optional / issue OppAdd LONG| LONG_LIVE
 
-    LONG_PROFIT --> CLEANUP_PROFIT: Cancel opposite + Recoup
-Reset cycle
-    SHORT_PROFIT --> CLEANUP_PROFIT: Cancel opposite + Recoup
-Reset cycle
+    ARMED -->|EOS| CLEANUP_EXIT
+    LONG_LIVE -->|EOS| CLEANUP_EXIT
+    SHORT_LIVE -->|EOS| CLEANUP_EXIT
+    LONG_LIVE -->|Early Exit (profit-only)| CLEANUP_EXIT
+    SHORT_LIVE -->|Early Exit (profit-only)| CLEANUP_EXIT
 
-    LONG_STOP --> WAIT_OPP: Keep opposite inventory
-(Short bracket + optional Recoup)
-    SHORT_STOP --> WAIT_OPP: Keep opposite inventory
-(Long bracket + optional Recoup)
-
-    WAIT_OPP --> LONG_LIVE: Opposite long fills
-    WAIT_OPP --> SHORT_LIVE: Opposite short fills
-    WAIT_OPP --> REARM: Inventory cleared
-rearm permitted
-
-    LONG_EARLY_EXIT --> CLEANUP_EXIT: Cancel + flatten
-Stand down
-    SHORT_EARLY_EXIT --> CLEANUP_EXIT: Cancel + flatten
-Stand down
-
-    EOS --> CLEANUP_EXIT: Cancel + flatten
-Stand down
-
-    CLEANUP_PROFIT --> REARM: Rearm allowed
-    REARM --> ARMED: If rearm gates pass
-    CLEANUP_EXIT --> IDLE
+    CLEANUP_PROFIT -->|Rearm allowed| REARM
+    REARM -->|If rearm gates pass| ARMED
+    CLEANUP_EXIT -->|Cancel + flatten / stand down| IDLE
 
 ```
 
