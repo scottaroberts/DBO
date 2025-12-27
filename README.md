@@ -2,8 +2,6 @@
 
 This repo contains the **current TradingView strategy** used for the DBO bot (“DBO_Prod”). The focus of this README is **business rules** (what the system does and why), plus a **feature inventory** you can use to plan a migration to a new platform.
 
-> Historical docs that inspired parts of this README: the bracket-cycle spec and the MVP simplification spec. fileciteturn0file1 fileciteturn0file2
-
 ---
 
 ## What the bot does (1‑minute mental model)
